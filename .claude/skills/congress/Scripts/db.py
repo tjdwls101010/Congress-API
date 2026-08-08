@@ -572,11 +572,20 @@ def upsert_member(db: sqlite3.Connection, open_na_id: str, *,
     """
     cols = {"name": name, "assembly_unit": assembly_unit, **fields}
     cols = {k: v for k, v in cols.items() if v is not None}
-    cols.setdefault("name", open_na_id)  # 이름조차 모르면 slug를 임시로 둔다
+    # 이름조차 모르면 slug를 임시로 둔다 — name 이 NOT NULL 이라 자리는 채워야 한다.
+    cols.setdefault("name", open_na_id)
     now = now_str()
     names = ["open_na_id", *cols, "collected_at", "updated_at"]
     vals = [open_na_id, *cols.values(), now, now]
-    sets = ", ".join(f"{c} = COALESCE(excluded.{c}, {c})" for c in cols)
+    # ⚠️ name 만 COALESCE 로 두면 **임시 이름(slug)이 진짜 이름을 영영 막는다.**
+    #    스텁이 name='KIMHyun' 을 심어 두면 나중에 상세가 '김현' 을 들고 와도
+    #    COALESCE(excluded.name, name) 가 'KIMHyun' 을 이긴다 — 에러 없이 이름만 slug 로 남는다.
+    #    그래서 들어온 값이 slug 그 자체이면 "모른다"로 취급해 기존 값을 지킨다.
+    sets = ", ".join(
+        f"{c} = CASE WHEN excluded.name = excluded.open_na_id THEN {c} "
+        f"ELSE COALESCE(excluded.{c}, {c}) END" if c == "name"
+        else f"{c} = COALESCE(excluded.{c}, {c})"
+        for c in cols)
     db.execute(
         f"""INSERT INTO members ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})
             ON CONFLICT(open_na_id) DO UPDATE SET {sets}, updated_at = excluded.updated_at""",
@@ -781,10 +790,23 @@ def selftest(db_path: str) -> int:
     check("적은 정보로 다시 넣어도 정당이 안 지워진다",
           db.execute("SELECT party FROM members WHERE open_na_id='LEEHAIMIN'").fetchone()[0]
           == "조국혁신당")
+    # 스텁이 먼저(이름 모름) → 상세가 나중(이름 있음). 흔한 실제 순서다.
+    upsert_member(db, "CHOIMinhee")                        # 표결 명단에서 slug만 봤다
+    check("이름을 모르면 slug가 자리를 채운다",
+          db.execute("SELECT name FROM members WHERE open_na_id='CHOIMinhee'").fetchone()[0]
+          == "CHOIMinhee")
+    upsert_member(db, "CHOIMinhee", name="최민희", party="더불어민주당")
+    check("진짜 이름이 임시 이름(slug)을 덮는다",
+          db.execute("SELECT name FROM members WHERE open_na_id='CHOIMinhee'").fetchone()[0]
+          == "최민희")
+    upsert_member(db, "CHOIMinhee")                        # 다시 이름 없는 원천이 와도
+    check("임시 이름이 진짜 이름을 되돌리지 못한다",
+          tuple(db.execute("SELECT name, party FROM members WHERE open_na_id='CHOIMinhee'")
+                .fetchone()) == ("최민희", "더불어민주당"))
     upsert_member(db, "KIMHyun", name="김현", party="더불어민주당", is_incumbent=1)
     upsert_member(db, "CHUNJAESOO", name="전재수", party="더불어민주당", is_incumbent=0)
     check("mona_cd가 NULL이어도 들어간다 (전직 의원·시드 없음이 정상)",
-          db.execute("SELECT COUNT(*) FROM members WHERE mona_cd IS NULL").fetchone()[0] == 3)
+          db.execute("SELECT COUNT(*) FROM members WHERE mona_cd IS NULL").fetchone()[0] == 4)
     upsert_member(db, "AAA", name="동명", mona_cd="X1")
     try:
         upsert_member(db, "BBB", name="동명", mona_cd="X1")
