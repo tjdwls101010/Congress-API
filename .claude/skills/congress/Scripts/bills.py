@@ -352,7 +352,10 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
                                  [{"bill_no": bill_no, "open_na_id": p["open_na_id"],
                                    "role": p["role"]} for p in proposers],
                                  expected=len(proposers))
-        if votes:
+        # ⚠️ 본회의 단계가 있어도 표결이 없는 의안이 있다(대안반영폐기 등).
+        #    그때 요약 행을 만들면 숫자가 전부 NULL인 유령 행이 남아 "표결이 있다"는
+        #    조인이 그 의안을 잡는다. 실제 표결 숫자가 온 경우에만 쓴다.
+        if votes and votes[0].get("yes") is not None:
             vs, vlist = votes
             db.execute("""INSERT INTO bill_vote_summary VALUES (?,?,?,?,?,?,?,?,?)
                           ON CONFLICT(bill_no) DO UPDATE SET
