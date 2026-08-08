@@ -239,10 +239,20 @@ def collect_one(db, session: net.Session, conference_id: int, committee_class: s
                            detail=f"parse:{type(e).__name__}: {e}"[:200])
         return False
 
-    # ⚠️ 22대가 아닌 회의가 트리에 섞여 올 수 있다. 대수는 본문 메타로 판정하고 버린다.
+    # ⚠️ 대수가 22가 아니면 **저장하지 않는다.** 22대 트리가 준 id 인데 본문이 20·21대라는
+    #    것은 둘 중 하나다 — 트리가 잘못 넣었거나, 원천이 다른 회의의 문서를 준 것이다.
+    #    어느 쪽이든 그 내용을 이 conference_id 에 붙이면 안 된다.
+    #
+    # ⚠️ **이것을 gone 으로 분류하면 안 된다.** 실측(2026-08-09): 수집 중 21대로 읽혔던
+    #    55342·55256·55396 을 나중에 다시 받으니 전부 안정적으로 22대였다. 즉 대부분
+    #    일시적 플래핑이고, gone 은 재시도 큐에서 빠지므로 그 회의를 영영 잃는다.
+    #    fetch_body 의 자기 id 대조가 이 부류를 못 잡는 이유는 **그 문서들이 자기 id 링크를
+    #    아예 갖고 있지 않아서**다(실측 확인). 그래서 여기가 유일한 방어선이고,
+    #    방어의 내용은 "버리기"가 아니라 "다음 실행에 다시 시도하기"여야 한다.
     if meta["assembly_unit"] != 22:
-        dbm.record_failure(db, "meeting_body", conference_id, kind="gone",
-                           detail=f"scope:assembly_unit={meta['assembly_unit']}")
+        dbm.record_failure(db, "meeting_body", conference_id,
+                           detail=f"scope:assembly_unit={meta['assembly_unit']} "
+                                  f"(원천 플래핑일 수 있다 — 다음 실행이 재시도한다)")
         return False
 
     db.execute("BEGIN")
