@@ -280,6 +280,13 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
     try:
         d = parse_detail(session.get(f"{DETAIL}?billId={bill_id}").text)
         f = d["fields"]
+        # ⚠️ 받은 문서가 요청한 의안이 맞는지 대조한다. record 회의록 뷰어에서 **같은 URL이
+        #    다른 회의를 주는 것**을 실측했기 때문에 같은 계열 인프라를 의심하는 것이다.
+        #    likms 는 15회 연속 요청에서 불일치가 없었지만(응답 크기까지 동일), 방어 비용이
+        #    사실상 0이다 — billNo 가 이미 파싱하는 폼 안에 있다. 2만 건을 돌리는 동안
+        #    한 번이라도 어긋나면 그 의안의 단계·발의자·표결이 통째로 남의 것이 된다.
+        if f.get("billNo") != bill_no:
+            raise ValueError(f"다른 의안의 문서가 왔다 (요청 {bill_no} / 문서 {f.get('billNo')})")
         info = session.xhr(INFO, {**f, "_csrf": session.likms_csrf()},
                            referer=net.LIKMS_SEARCH_PAGE).text
         stages, meetings, extra = parse_info(info)

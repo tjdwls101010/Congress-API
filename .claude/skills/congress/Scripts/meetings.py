@@ -205,14 +205,19 @@ def fetch_body(session: net.Session, conference_id: int, tries: int = 4) -> str:
         r.raise_for_status()
         last = r.text
         found = set(SELF_ID_RE.findall(last))
-        if str(conference_id) in found:
+        id_ok = str(conference_id) in found or not found
+        # ⚠️ 메타 줄이 없는 응답도 온다. h2 · .tit 이 **둘 다 빈** 문서가 실재하고,
+        #    그러면 형식이 다른 .minutes_header 로 떨어져 파싱이 깨진다(실측 8건).
+        #    이것도 플래핑이라 다시 받으면 대개 들어 있다 — 그래서 "쓸 만한 문서인가"를
+        #    여기서 한 번에 판정한다. 파싱 단계에서 실패시키면 재시도가 다음 실행으로
+        #    미뤄져 그 회의가 하루씩 늦어진다.
+        meta_ok = any(META_RE.search(t) for t in
+                      (n.text(separator=" ", strip=True)
+                       for n in HTMLParser(last).css("h2, .tit")) if t)
+        if id_ok and meta_ok:
             return last
-        # 자기 id를 아예 안 밝히는 문서는 대조할 근거가 없으니 통과시킨다 —
-        # 잘못된 문서라고 단정할 수도 없다.
-        if not found:
-            return last
-    raise ValueError(f"다른 회의의 문서가 왔다 (요청 {conference_id} / 문서 "
-                     f"{sorted(set(SELF_ID_RE.findall(last)))[:3]})")
+    raise ValueError(f"쓸 만한 문서를 못 받았다 (요청 {conference_id} / 문서가 말하는 id "
+                     f"{sorted(set(SELF_ID_RE.findall(last)))[:3]} / 메타 줄 없음 가능)")
 
 
 def collect_one(db, session: net.Session, conference_id: int, committee_class: str) -> bool:
