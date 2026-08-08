@@ -1,0 +1,38 @@
+# 워치독 — 감시 대상이 맥이므로 감시자는 맥 밖에 있어야 한다.
+#
+# 러너가 죽거나 맥이 하루 넘게 꺼져 있으면 예약 run 이 24시간 큐 대기 후 cancelled 로
+# 사라진다. **취소는 실패가 아니라서 알림이 가지 않는다** — 그래서 "아무 메일도 안 왔으니
+# 잘 돌고 있나 보다"가 몇 주씩 이어질 수 있다. 이 워크플로가 그 침묵을 깬다.
+name: collect-watchdog
+
+on:
+  schedule:
+    - cron: "0 3 * * *"    # 12:00 KST — 수집이 끝났어야 할 시각 이후
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "성공한 수집이 이보다 오래됐으면 실패로 본다 (-1 을 주면 빨간불 경로를 시험한다)"
+        default: "30"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 마지막 성공 수집이 언제인가
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE: ${{ github.event.inputs.max_age_hours || '30' }}
+        run: |
+          set -euo pipefail
+          last=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow scheduled-collect.yml \
+                   --status success --limit 1 --json updatedAt --jq '.[0].updatedAt // empty')
+          if [ -z "$last" ]; then
+            echo "::error::scheduled-collect 의 성공 기록이 하나도 없다. 러너가 이 저장소에 등록돼 있나?"
+            exit 1
+          fi
+          age=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 3600 ))
+          echo "마지막 성공: $last (${age}시간 전) · 임계 ${MAX_AGE}시간"
+          if [ "$age" -gt "$MAX_AGE" ]; then
+            echo "::error::${age}시간째 성공한 수집이 없다. 러너가 죽었거나 맥이 꺼져 있다."
+            exit 1
+          fi

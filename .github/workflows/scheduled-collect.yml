@@ -1,0 +1,36 @@
+# 정기 수집 — 하루 1회 새벽(KST).
+#
+# runs-on: self-hosted 인 이유는 DB가 로컬 파일이라서다. 클라우드 러너에는 그 파일이 없다.
+# GitHub은 크론·로그·알림만 맡고 실행은 맥이 한다.
+#
+# ⚠️ 이 저장소에 등록된 self-hosted 러너가 있어야 한다. ~/actions-runner-congress 가
+#    이미 있어도 그것은 폐기한 Congress-DB 소속이므로 이 저장소에는 잡히지 않는다.
+#    러너가 없으면 예약 run 이 24시간 큐에 걸렸다가 cancelled 로 사라지는데,
+#    **취소는 실패가 아니라서 알림이 가지 않는다.** collect-watchdog.yml 이 그걸 잡는다.
+name: scheduled-collect
+
+on:
+  schedule:
+    - cron: "0 19 * * *"   # 04:00 KST
+  workflow_dispatch:
+
+# 예약 run 끼리 직렬화한다. 스크립트에도 파일 락이 있지만(손실행까지 막아야 하므로)
+# 여기서 막으면 애초에 러너를 점유하지 않는다.
+concurrency:
+  group: congress-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: self-hosted
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+      - name: 수집
+        run: |
+          uv run .claude/skills/congress/Scripts/collect.py --rate 4 | tee /tmp/collect.json
+      - name: 불변조건 요약
+        if: always()
+        run: |
+          uv run .claude/skills/congress/Scripts/audit.py \
+            --db .claude/skills/congress/CONGRESS.db >> "$GITHUB_STEP_SUMMARY"
