@@ -1,0 +1,15 @@
+# 참고용 심볼릭 링크 (Naver-News 저장소를 가리킨다)
+.tmp/
+
+# 수집 DB — 재구축이 가능하고 매번 통째로 바뀌는 바이너리라 커밋하지 않는다
+.claude/skills/congress/CONGRESS.db
+.claude/skills/congress/CONGRESS.db-wal
+.claude/skills/congress/CONGRESS.db-shm
+.claude/skills/congress/*.lock
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+.DS_Store
