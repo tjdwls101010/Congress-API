@@ -1,74 +1,50 @@
-# 스키마
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""CONGRESS.db — 스키마, 연결, 그리고 완결성을 떠받치는 쓰기 규율.
 
-## 이 스키마가 지켜야 할 약속
+이 모듈이 지키는 약속은 셋이다.
 
-**클로드가 `.schema` 한 번만 읽고 전체 구조와 의미를 파악할 수 있어야 한다.** 그래서 SQLite에 `COMMENT ON`이 없다는 사실이 중요하다 — 주석은 DDL 안에 `--`로 적히고, 그것이 곧 `.schema` 출력에 그대로 나온다. **스키마 파일이 문서다.** 별도 설명 문서를 만들어 이중 장부를 만들지 마라. 낡는 쪽은 언제나 별도 문서다.
+**① 스키마가 곧 문서다.** `.schema` 한 번을 읽은 클로드가 추가 문서 없이 테이블 간
+관계와 각 컬럼의 함정을 파악할 수 있어야 한다. 그래서 주석은 **반드시 `CREATE TABLE`의
+괄호 안**에 있다 — SQLite는 문장을 파싱해 다시 쓰면서 괄호 **밖**의 주석을 버리므로,
+테이블 위에 적은 설명은 `.schema`에 도달하지 못한다. `selftest`가 이걸 잠근다.
 
-주석에 적을 것은 컬럼 이름이 이미 말하는 것이 아니라 **말하지 않는 것**이다. `title TEXT -- 의안명`은 토큰 낭비다. `-- ⚠️ 안건은 회의 단위다. 발언과 잇지 마라`가 값이 있다.
+**② 수집 상태를 corpus에 두지 않는다.** `detail_status='ok'|'pending'` 같은 열거형
+컬럼이 생기면 모든 조회 질의가 그 술어를 기억해야 하고, 한 번 빠뜨리면 미완성 행이
+조용히 섞인다. 대신 판정자를 하나만 두고 그것이 거짓말할 수 없게 만든다 —
+`bills.detail_collected_at`은 상세 트랜잭션이 커밋될 때만 값이 들어가고,
+회의 본문은 `meeting_utterances`에 자식 행이 있는지로 판정한다.
 
-> ⚠️ **주석은 반드시 `CREATE TABLE (` 괄호 *안*에 써라. 앞에 쓰면 `.schema`에 안 나온다.**
->
-> SQLite는 `sqlite_master.sql`에 **원문을 그대로 저장하지 않는다** — 문장을 파싱해 다시 쓰면서 `CREATE TABLE` **앞**의 주석을 버린다. 괄호 안이면 컬럼 옆 주석이든 독립된 줄이든 그대로 남는다.
->
-> ```sql
-> -- 이 줄은 .schema 에 안 나온다          ← 테이블 설명이 여기 있으면 통째로 사라진다
-> CREATE TABLE t (
->     -- 이 줄은 나온다
->     a TEXT      -- 이것도 나온다
-> );
-> ```
->
-> 초안은 테이블 설명을 전부 `CREATE TABLE` 위에 두어 **238줄 중 70줄(29%)이 `.schema`에 도달하지 못했다.** 하필 가장 중요한 것들이었다 — `불참은 여기 없다`(bill_votes), `UPDATE가 아니라 INSERT로 쌓는다`(bill_stages), `FK 때문에 데이터를 버리지 마라`(committees). "`.schema`가 곧 문서다"라는 이 절의 전제가 조용히 거짓이 되고 있었다.
->
-> 그래서 아래 DDL은 테이블 설명을 전부 괄호 안 첫머리로 옮겼다. **주석을 새로 붙일 때도 같은 자리에 붙여라.** `selftest`의 주석 회귀 테스트가 이걸 잠근다 — 테스트는 `.schema` 출력을 보므로, 밖에 쓰면 그 순간 실패한다.
+**③ 부분 실패가 데이터를 지우지 못한다.** 발의자·표결처럼 목록 전체를 다시 받는
+자식 테이블은 `DELETE 후 INSERT`가 자연스러워 보이지만, 파싱이 한 번 실패하면 그 의안의
+발의자가 전멸한다. 그래서 자식 목록 교체는 `replace_children`만 쓰고, 그 함수는
+**원천이 스스로 말한 기대 건수와 일치할 때만** 지운다.
 
-## 이름 규칙
+직접 실행하면 스키마를 만들고 자체 점검을 돈다:
 
-**접두어로 도메인을 묶는다.** 알파벳 정렬만 해도 한 덩어리로 보이고, 관련 없는 테이블이 사이에 끼지 않는다.
+    uv run db.py selftest --db /tmp/t.db
+"""
+from __future__ import annotations
 
-```
-committees                                          ← 세 도메인이 함께 가리키는 차원
-members · member_committees
-bills · bill_stages · bill_proposers · bill_votes · bill_vote_summary · bill_meetings
-meetings · meeting_speakers · meeting_utterances · meeting_agenda
-collect_failures
-```
+import argparse
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-**날짜와 시각을 이름 모양으로 가른다.**
+KST = timezone(timedelta(hours=9))
 
-| 모양 | 형식 | 뜻 | 예 |
-|---|---|---|---|
-| `date_*` | `YYYY-MM-DD` (10자) | 국회에서 일어난 일의 날짜 | `date_proposed` · `date_processed` · `date_meeting` |
-| `*_at` | `YYYY-MM-DD HH:MM:SS` KST (19자) | **우리가** 수집한 시각 | `collected_at` · `updated_at` |
+#: 재시도 상한. 넘으면 큐에서 빠진다 — 상한이 없으면 완결성 조건이 영영 성립하지 않아
+#: 매 실행이 실패로 보이고, 그러면 사람이 곧 경고 전체를 무시한다.
+MAX_ATTEMPTS = 5
 
-이 구분이 필요한 이유는 두 축이 한 `WHERE`에 섞이기 때문이다. "지난 수집 이후 처리 단계가 바뀐 의안"을 묻는 질의가 `updated_at`과 `date_processed`를 같이 쓰는데, 형식이 다르면 사전순 = 시간순이 두 컬럼 **사이에서만** 깨진다. 각 컬럼만 보면 정렬이 멀쩡해서 눈에 띄지 않는다.
+#: 실제 수집 DB. selftest 는 이 경로를 거부한다 (아래 main 참조).
+DB_PATH = Path(__file__).resolve().parent.parent / "CONGRESS.db"
 
-## 수집 완료를 어떻게 판정하나
-
-의안과 회의는 **싼 목록 정보**와 **비싼 상세 정보**가 따로 온다. 그래서 "이 행은 어디까지 채워졌나"를 물을 방법이 필요한데, `detail_status = 'ok'|'pending'|'failed'` 같은 열거형 상태 컬럼은 두지 않는다. 그런 컬럼이 생기면 모든 조회 질의가 그 술어를 기억해야 하고, 한 번 빠뜨리면 미완성 행이 결과에 조용히 섞인다.
-
-대신 **판정자를 하나만 두고 그것이 거짓말할 수 없게 만든다.**
-
-| 대상 | 판정자 | 왜 이것인가 |
-|---|---|---|
-| 의안 상세 | `bills.detail_collected_at IS NULL` | 상세 트랜잭션이 커밋될 때만 값이 들어간다 |
-| 회의 본문 | `meeting_utterances`에 행이 있는가 | 발언 없는 회의록은 없으므로 자식 행의 존재가 곧 완결이다 |
-
-**`reason_text IS NULL`을 판정자로 쓰면 안 된다.** 제안이유가 원래 비어 있는 법률안이 있을 수 있고, 그러면 그 의안은 영원히 "미수집"으로 잡혀 매 실행이 자기를 다시 받는다. 판정자는 **우리가 쓴 시각**이어야지 원천에서 온 값이면 안 된다.
-
-```sql
--- 상세를 아직 안 받은 법률안
-SELECT bill_no FROM bills
-WHERE bill_kind = '법률안' AND detail_collected_at IS NULL;
-```
-
----
-
-## DDL
-
-아래는 구현의 출발점이다. 컬럼이 더 필요해지면 늘려도 되지만, **주석은 지우지 마라** — 함정을 적어 둔 것이고 그게 이 스키마의 값어치다.
-
-```sql
+SCHEMA = r"""
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous  = NORMAL;
 PRAGMA foreign_keys = ON;
@@ -509,133 +485,481 @@ CREATE TABLE IF NOT EXISTS collect_failures (
     last_attempt_at TEXT,
     PRIMARY KEY (target_kind, target_key)
 );
-```
+"""
 
-## 뷰를 두지 않는다
 
-편의 뷰는 팬아웃을 감춘다. `bill_proposers`를 조인한 뷰에서 `COUNT(*)`를 세면 발의자 수만큼 부풀고, 그걸 모르고 집계하면 조용히 틀린다. 클로드는 조인을 직접 쓴다 — FK가 스키마에 박혀 있으면 어떻게 이어야 하는지가 `.schema` 한 번에 보인다.
+def now_str() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
-## 전문검색 인덱스(FTS5)를 두지 않는다
 
-trigram 토크나이저는 **3자 미만 질의에 에러 없이 0건을 준다.** 이 도메인에서 가장 자연스러운 질의어가 하필 전부 2자다 — `특검` · `개헌` · `국회` · `예산` · `AI` · `공포` · `표결`. 빈 결과가 이상해 보이지도 않아서 발견되지 않는다.
+def connect(path: str | Path) -> sqlite3.Connection:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path), timeout=30.0, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA synchronous = NORMAL")
+    # SCHEMA 안의 PRAGMA foreign_keys 는 이 연결에 적용되지 않는다 — 연결마다 켜야 한다.
+    # 이걸 빠뜨리면 FK가 조용히 꺼진 채 돌고, 고아 행이 들어와도 아무 에러가 없다.
+    db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA busy_timeout = 30000")
+    return db
 
-`LIKE`는 2자든 6자든 정확하고 부가 용량이 0이다. 날짜·위원회·의원 인덱스가 먼저 범위를 좁히므로 그 안의 스캔은 빠르다. "검색이 느리니 FTS를 붙이자"는 제안이 나오면 **2자 질의 폴백을 함께 설계해야 한다**는 조건을 붙여라.
 
-## 관계 지도 — 같은 내용의 필드는 반드시 이어져 있다
+def init_schema(db: sqlite3.Connection) -> None:
+    db.executescript(SCHEMA)
 
-여러 테이블에 나타나는 개념은 **전부 한 곳을 가리킨다.** 자유 텍스트로 두면 표기가 갈라지고, 갈라진 순간 조인이 조용히 일부만 준다 — 에러가 아니라 **적은 결과**로 나타나서 발견되지 않는다.
 
-| 개념 | 정본 | 가리키는 곳 |
-|---|---|---|
-| 위원회 | `committees.committee_name` | `bills.committee_name` · `bill_stages.committee_name` · `meetings.committee_name` · `member_committees.committee_name` |
-| 의원 | `members.open_na_id` | `bill_proposers` · `bill_votes` · `meeting_speakers` · `member_committees` |
-| 의안 | `bills.bill_no` | `bill_stages` · `bill_proposers` · `bill_votes` · `bill_vote_summary` · `bill_meetings` |
-| 회의 | `meetings.conference_id` | `meeting_speakers` · `meeting_utterances` · `meeting_agenda` |
+def schema_drift(db: sqlite3.Connection) -> list[str]:
+    """이 DB에 실제로 박힌 스키마가 현재 SCHEMA와 다른 테이블 이름들.
 
-`meeting_utterances`에서 의원까지는 **두 홉**이고, 그 사이의 `speaker_no`는 사람의 식별자가 아니라 회의 안의 자리번호다.
+    DDL이 ``CREATE TABLE IF NOT EXISTS``라서 **기존 DB에는 변경이 조용히 적용되지 않는다.**
+    그래서 스키마 주석을 고쳐도 실제 수집 DB는 옛 주석을 그대로 들고 있고, 클로드가
+    `.schema`로 읽는 것은 그 옛 주석이다 — 이 프로젝트의 1차 인터페이스가 낡는데
+    아무도 모르는 상태가 된다. selftest 는 새 DB에서 도니 이걸 잡지 못한다.
 
-```
-meeting_utterances.speaker_no
-   └→ meeting_speakers(conference_id, speaker_no)     ← 여기서 사람이 특정된다
-         └→ open_na_id → members                      ← 의원일 때만. 비의원은 NULL
-```
+    그래서 ``init``이 매번 대조한다. 값이 비어 있지 않으면 마이그레이션이 필요하다는 뜻이다.
+    """
+    fresh = sqlite3.connect(":memory:")
+    fresh.executescript(SCHEMA)
+    want = {r[0]: r[1] for r in
+            fresh.execute("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+    have = {r[0]: r[1] for r in
+            db.execute("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+    return sorted(n for n in want if n in have and want[n] != have[n])
 
-**한 단계를 거치는 이유는 발언자의 42%가 의원이 아니기 때문이다**(실측 105블록 중 44개가 차관·청장·수석전문위원). 발언에 `open_na_id`를 바로 달면 그 44개가 전부 NULL이 되어 **서로 다른 두 증인을 구분할 방법이 사라진다.** `speaker_no`는 의원이든 아니든 똑같이 붙으므로 그 구멍을 메운다.
 
-두 홉이 느리지 않도록 양쪽에 인덱스가 있다 — `meeting_speakers(open_na_id)`로 화자 행을 찾고 `meeting_utterances(conference_id, speaker_no)`로 발언을 끌어온다.
+# ═══════════════════════════════════════════════════════════════
+# 차원 UPSERT — 참조되는 쪽을 먼저 쓴다
+# ═══════════════════════════════════════════════════════════════
 
-### FK를 일부러 안 건 세 곳 — 그리고 대신 무엇을 하나
+def upsert_committee(db: sqlite3.Connection, name: str, *,
+                     committee_class: str | None = None,
+                     parent: str | None = None) -> None:
+    """모르는 위원회명을 만나면 거부하지 말고 먼저 등록한다.
 
-FK가 없는 것은 실수가 아니라 **데이터를 잃지 않기 위한 선택**이다. 다만 그만큼 조용히 깨질 수 있으므로 **감사 질의가 FK를 대신한다.**
+    FK의 목적은 표기가 갈라지지 않게 하는 것이지 새 값을 막는 것이 아니다.
+    수집 중 이 함수를 부르지 않고 바로 INSERT하면 FK 위반으로 **그 데이터를 잃는다.**
 
-**`bills.alt_bill_id` → `bills.bill_id`** — 대안이 아직 수집 전일 수 있는 전방 참조라 FK를 걸면 수집이 막힌다.
+    ⚠️ ``parent``가 있으면 상위 위원회를 먼저 등록한다 — 자기참조 FK라 순서가 강제된다.
+    ⚠️ ``first_seen_at``은 절대 덮어쓰지 않는다. committees에는 updated_at이 없어서
+       이 컬럼이 유일한 시각이고, 덮어쓰면 "언제 처음 봤나"가 매 실행 오늘로 밀린다.
+    """
+    if parent:
+        upsert_committee(db, parent)
+    db.execute(
+        """INSERT INTO committees (committee_name, committee_class, parent_committee, first_seen_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(committee_name) DO UPDATE SET
+               committee_class  = COALESCE(excluded.committee_class, committee_class),
+               parent_committee = COALESCE(excluded.parent_committee, parent_committee)""",
+        (name, committee_class, parent, now_str()))
 
-```sql
--- 백필 완료 후 0이어야 한다
-SELECT COUNT(*) FROM bills b WHERE b.alt_bill_id IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM bills t WHERE t.bill_id = b.alt_bill_id);
-```
 
-**`bill_meetings.conference_id` → `meetings`** — 본회의 회의는 본문 수집 범위 밖이라 `meetings`에 없을 수 있다. FK를 걸면 그 연결 정보까지 버리게 된다.
+def upsert_member(db: sqlite3.Connection, open_na_id: str, *,
+                  name: str | None = None, assembly_unit: int = 22, **fields) -> None:
+    """slug를 만난 자리에서 members 행을 만든다. 이미 있으면 아는 것만 보탠다.
 
-```sql
--- 본회의를 뺀 나머지는 0이어야 한다. 0이 아니면 회의록 트리가 빠뜨린 것이다
-SELECT COUNT(*) FROM bill_meetings bm
-WHERE bm.stage <> '본회의'
-  AND NOT EXISTS (SELECT 1 FROM meetings m WHERE m.conference_id = bm.conference_id);
-```
+    명부 API가 막혀 있어 시작 시점의 의원 목록이 없다. 그래서 members는 선행 단계가
+    아니라 다른 수집의 부산물로 자란다 — 표결·발의자·발언에서 slug를 만날 때마다
+    여기를 부르고, 그 다음 상세 페이지가 나머지를 채운다.
 
-**`meeting_agenda.bill_no` → `bills`** — 22대 밖 의안이나 청원이 안건으로 오를 수 있다.
+    ⚠️ 모든 보강은 COALESCE다. 정보가 적은 원천(표결 명단은 이름만 준다)이 나중에
+       와도 이미 아는 값을 NULL로 되돌리지 않는다. 이게 없으면 수집 순서에 따라
+       정당이 있다 없다 한다.
+    ⚠️ 이름만 있고 정당이 NULL인 행은 에러 없이 샌다 — GROUP BY party가 NULL 버킷으로
+       몰아넣기 때문이다. 그래서 감사에 members_missing_party 가 있다.
+    """
+    cols = {"name": name, "assembly_unit": assembly_unit, **fields}
+    cols = {k: v for k, v in cols.items() if v is not None}
+    cols.setdefault("name", open_na_id)  # 이름조차 모르면 slug를 임시로 둔다
+    now = now_str()
+    names = ["open_na_id", *cols, "collected_at", "updated_at"]
+    vals = [open_na_id, *cols.values(), now, now]
+    sets = ", ".join(f"{c} = COALESCE(excluded.{c}, {c})" for c in cols)
+    db.execute(
+        f"""INSERT INTO members ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})
+            ON CONFLICT(open_na_id) DO UPDATE SET {sets}, updated_at = excluded.updated_at""",
+        vals)
 
-```sql
--- 0이 아닌 것이 정상. 다만 급증하면 의안 수집이 빠뜨리고 있다는 신호다
-SELECT COUNT(*) FROM meeting_agenda a WHERE a.bill_no IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM bills b WHERE b.bill_no = a.bill_no);
-```
 
-### 일부러 잇지 않은 것
+# ═══════════════════════════════════════════════════════════════
+# 의안 — 목록 갱신이 상세를 지우지 못하게
+# ═══════════════════════════════════════════════════════════════
 
-**처리결과 문자열**(`bills.decision_result` · `bill_stages.result` · `bill_vote_summary.result` · `bill_meetings.result`)은 어휘가 겹치지만 **차원 테이블을 두지 않는다.** 아무도 여기를 조인 키로 쓰지 않고 — 조인은 언제나 의안·의원·회의로 한다 — 값 집합이 열려 있어 `CHECK`도 맞지 않는다. 어떤 값이 있는지는 `SELECT DISTINCT`가 답한다.
+#: 목록 요청에서 오는 컬럼. 이 밖의 것은 상세에서만 오고 목록 갱신이 건드리면 안 된다.
+BILL_LIST_COLS = ("bill_id", "assembly_unit", "bill_kind", "title", "proposer_kind",
+                  "proposer_summary", "date_proposed", "date_decided", "decision_result",
+                  "review_status")
 
-**`assembly_unit`**은 세 테이블에 있지만 지금은 전부 22인 상수라 차원 테이블을 만들 이유가 없다. 대수를 넓힐 때 다시 판단한다.
 
-## 스키마의 맹점을 DB 안에서 메운다
+def upsert_bill_list(db: sqlite3.Connection, row: dict) -> None:
+    """목록 행을 넣거나 갱신한다. **이미 받아 둔 상세 컬럼은 건드리지 않는다.**
 
-별도 조회 가이드 문서를 쓰기 전에 **DB 자체로 해결되는지 먼저 물어라.** 문서는 낡아도 아무도 모르지만, 아래 셋은 데이터와 함께 갱신되거나 애초에 틀릴 수 없다.
+    ⚠️ ``INSERT OR REPLACE``를 쓰면 안 된다. REPLACE는 행을 지우고 다시 넣으므로
+       명시하지 않은 컬럼이 전부 기본값으로 돌아간다 — 애써 받은 reason_text 와
+       detail_collected_at 이 조용히 사라지고, 중복 행이 안 생기니 겉보기엔 멀쩡하며,
+       증상은 "매 실행마다 전량을 다시 받는다"로만 나타나 성능 문제로 오진하기 쉽다.
+    """
+    cols = {k: row.get(k) for k in BILL_LIST_COLS if k in row}
+    now = now_str()
+    names = ["bill_no", *cols, "collected_at", "updated_at"]
+    vals = [row["bill_no"], *cols.values(), now, now]
+    sets = ", ".join(f"{c} = excluded.{c}" for c in cols)
+    db.execute(
+        f"""INSERT INTO bills ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})
+            ON CONFLICT(bill_no) DO UPDATE SET {sets}, updated_at = excluded.updated_at""",
+        vals)
 
-**어휘 문제 → `SELECT DISTINCT`.** 클로드가 정확한 문자열을 몰라 0건을 받는 것이 조회 실패의 가장 흔한 원인이고, 0건은 "없다"처럼 보여서 실패로 인식되지도 않는다. 그런데 **DB 자신이 이미 그 사전이다** — `SELECT DISTINCT committee_name FROM committees`, `SELECT DISTINCT review_status FROM bills`가 답이다. 별도 사전 테이블은 같은 사실의 사본이고, 사본은 어긋날 수 있는데 어느 쪽이 맞는지 알 방법이 없다. SKILL.md에 "값은 추측하지 말고 DISTINCT로 먼저 확인하라" 한 줄을 두는 것으로 끝난다.
 
-**참조 무결성 문제 → 차원 테이블 + FK.** 이건 사전과 다르다. `committees`가 그 예로, 세 도메인이 같은 위원회명을 들고 있는데 일치 보장이 없으면 표기 차이 하나에 조인이 조용히 0건이 된다. FK는 편의가 아니라 제약이다.
+# ═══════════════════════════════════════════════════════════════
+# 자식 목록 교체 — 부분 실패가 데이터를 지우지 못하게
+# ═══════════════════════════════════════════════════════════════
 
-**허용값 문제 → `CHECK` 제약.** 닫힌 집합(`찬성|반대|기권`)은 스키마에 박아 두면 `.schema` 한 번으로 전달된다. 문서에 적으면 스키마와 어긋날 수 있지만 제약은 어긋날 수 없다.
+class PartialListError(RuntimeError):
+    """받은 목록이 기대 건수에 못 미친다. 지우지 않고 실패로 기록해야 한다."""
 
-**표기 흔들림 문제 → 생성 컬럼.** 의안명에 괄호·중점·공백이 섞여 있어 `LIKE '%정보통신공사업법%'`이 표기 차이로 빗나간다. 검색용 정규화 이름을 생성 컬럼으로 두면 항상 자동으로 따라온다.
 
-```sql
--- bills에 추가 (구현 시 정규화 규칙은 실데이터를 보고 정한다)
-ALTER TABLE bills ADD COLUMN title_norm TEXT GENERATED ALWAYS AS (
-    replace(replace(replace(title, ' ', ''), '·', ''), '‧', '')
-) VIRTUAL;
-CREATE INDEX IF NOT EXISTS idx_bills_title_norm ON bills(title_norm);
-```
+def replace_children(db: sqlite3.Connection, table: str, parent_col: str, parent_val,
+                     rows: list[dict], *, expected: int | None) -> int:
+    """부모에 딸린 자식 목록을 통째로 교체한다. **기대 건수와 맞을 때만 지운다.**
 
-> ⚠️ **`STORED`가 아니라 `VIRTUAL`이다.** 초안은 "인덱스를 걸 수 있어서 STORED"라고 적었는데 **두 부분이 다 틀렸다**(SQLite 3.45·3.51에서 실측).
->
-> | | 빈 테이블에 `ALTER … ADD` | **행이 있는 테이블에** | 인덱스 |
-> |---|---|---|---|
-> | `STORED` | 된다 | **`cannot add a STORED column`** | 걸린다 |
-> | `VIRTUAL` | 된다 | **된다** | **걸린다** |
->
-> 이 컬럼은 정규화 규칙을 실데이터로 정한 뒤 **3단계(의안 목록 2만 행 적재) 다음에** 붙이는 것이 요점인데, 그 시점엔 이미 행이 있어서 `STORED`가 거부된다. 그리고 `VIRTUAL`도 인덱스가 걸리고 실제로 인덱스를 탄다(`EXPLAIN QUERY PLAN` → `SEARCH bills USING INDEX idx_bills_title_norm`). **`STORED`를 고를 이유가 애초에 없었다.**
->
-> 규칙을 바꿀 때도 `VIRTUAL`이 유리하다 — 저장된 값이 없으므로 컬럼을 지웠다 다시 만들면 끝이고 테이블 재작성이 없다.
+    ``expected``는 원천이 스스로 말한 숫자다 — 발의자는 ``proposer_summary``의
+    '등 13인', 표결은 ``bill_vote_summary``의 찬성+반대+기권. 그 값과 받은 행 수가
+    다르면 파싱이 샌 것이므로 **기존 행을 그대로 두고** PartialListError 를 낸다.
 
-이 셋을 하고 나면 별도 문서에 남는 것은 **여러 테이블을 가로지르는 조합 레시피**뿐이다. 그런 것이 실제로 나왔을 때 그때 적어라.
+    ⚠️ "비어 있으면 지우지 않는다"만으로는 부족하다. 13명 중 4명만 파싱된 부분 실패가
+       그 조건을 통과해 나머지 9명을 지운다 — 막으려던 사고가 한 겹 얇아진 채 다시 들어온다.
+    ⚠️ ``expected=None``은 "기대 건수를 모른다"이지 "검사하지 마라"가 아니다.
+       그때는 **빈 목록만** 거부한다 (원천이 200에 빈 응답을 주는 일이 흔하다).
+    """
+    if expected is None:
+        if not rows:
+            raise PartialListError(f"{table}: 빈 목록이고 기대 건수를 모른다")
+    elif len(rows) != expected:
+        raise PartialListError(f"{table}: {len(rows)}행을 받았는데 기대는 {expected}행")
 
-## 국회 데이터 자체의 함정
+    db.execute(f"DELETE FROM {table} WHERE {parent_col} = ?", (parent_val,))
+    if not rows:
+        return 0
+    cols = list(rows[0])
+    db.executemany(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+        [[r[c] for c in cols] for r in rows])
+    return len(rows)
 
-출처가 웹이든 OpenAPI든 무관하게 성립하는 것들이다. 이전 프로젝트가 값을 치르고 기록해 둔 것을 옮겼다. **여기 있는 것은 전부 그쪽에서 실측으로 확인된 수치가 붙어 있다** — 추정이 아니다.
 
-**`'가결'`이라는 처리결과 값은 존재하지 않는다.** 실제 값은 `원안가결` · `수정가결` · `대안반영폐기` · `수정안반영폐기` · `철회` · `폐기` · `부결`이다. 통과 판정은 반드시 `IN ('원안가결','수정가결')`이어야 하고, **`decision_result IS NULL`은 미처리이지 부결이 아니다**(이전 프로젝트 실측 71%가 NULL). 실제 `'부결'`은 22대 전체에서 **2건뿐**이라 "부결 건수" 분석 자체가 거의 의미가 없다.
+# ═══════════════════════════════════════════════════════════════
+# 실패 원장 — corpus 밖. 비어 있는 것이 정상이다
+# ═══════════════════════════════════════════════════════════════
 
-**위원장 대안과 정부제출이 가결 법안의 64%다.** 이전 프로젝트 실측으로 가결 1,593건 중 1,026건에 개별 의원 대표발의자가 없었다 — 위원장 대안 768건, 정부제출 196건, 기타 위원회안 62건. **`bill_proposers`만 조인해서 "정당별 법안 통과 수"를 세면 가결의 64%가 조용히 사라진다.** 실제로 법이 되는 것은 대부분 위원장 대안 쪽이라 하필 가장 중요한 것들이 빠진다.
+def record_failure(db: sqlite3.Connection, target_kind: str, target_key: str, *,
+                   kind: str = "retriable", detail: str | None = None) -> int:
+    """실패를 원장에 남기고 누적 시도 횟수를 돌려준다.
 
-**대안·정부제출 법안은 위원회 단계 날짜가 구조적으로 NULL이다.** 대안은 소관위 심사 *중에* 만들어져서 회부 단계 자체가 없다. 가결 법안의 64~67%가 여기 해당하므로 **`bill_stages`를 INNER JOIN하면 법이 될 가능성이 가장 높은 법안들이 빠진다.** 언제나 LEFT JOIN이다.
+    ``detail``에 접두어를 붙여라 — ``network:``가 몰리면 전송 문제,
+    ``parse:``가 몰리면 DOM 변경이나 파서 결함이다. 다음 조치가 달라진다.
+    """
+    db.execute(
+        """INSERT INTO collect_failures (target_kind, target_key, kind, detail, attempts, last_attempt_at)
+           VALUES (?, ?, ?, ?, 1, ?)
+           ON CONFLICT(target_kind, target_key) DO UPDATE SET
+               kind = excluded.kind, detail = excluded.detail,
+               attempts = attempts + 1, last_attempt_at = excluded.last_attempt_at""",
+        (target_kind, str(target_key), kind, detail, now_str()))
+    return db.execute(
+        "SELECT attempts FROM collect_failures WHERE target_kind = ? AND target_key = ?",
+        (target_kind, str(target_key))).fetchone()[0]
 
-**의안명은 식별자가 아니다.** 서로 다른 의안이 같은 이름을 갖는다(이전 프로젝트 실측: distinct 이름이 전체의 약 1/5, 평균 5건/이름). 더 나쁜 것은 **같은 이름의 두 법안이 정반대 입장일 수 있다는 것**이다(노조법이 그 예다). 식별은 `bill_no`로, 구별은 `reason_text`와 발의자로 한다.
 
-**동명이인은 가설이 아니라 실재한다.** 이전 프로젝트에서 박지원 의원이 2명이었다 — 정당과 현직 여부까지 같고 생년월일·선거구·선수만 달랐다. 이름으로 조인하면 **서로 다른 두 사람의 데이터가 조용히 합쳐진다.**
+def clear_failure(db: sqlite3.Connection, target_kind: str, target_key: str) -> None:
+    """성공했으면 지운다. 원장이 비어 있는 것이 정상 상태다."""
+    db.execute("DELETE FROM collect_failures WHERE target_kind = ? AND target_key = ?",
+               (target_kind, str(target_key)))
 
-**위원회명은 원천마다 표기가 갈린다.** 이전 프로젝트 실측으로 회의록 쪽 위원회명 38종 중 의안 쪽과 **정확히 일치한 것은 24종뿐**이었고, 공백을 제거하니 30종이 맞았다. `committees` 차원 테이블과 유사 중복 감사가 있는 이유가 이것이다.
 
-**대안반영폐기가 본회의 단계에만 있는 것이 아니다.** 소관위에서 심사가 종료돼 본회의에 올라가지도 못한 원안이 대안에 흡수되는 경우가 있다(이전 프로젝트 실측 459~487건). 그런 의안은 본회의 처리결과가 비어 있고 **위원회 처리결과에만 대안반영폐기가 적힌다.** "대안에 흡수된 법안"을 찾을 때 본회의 결과만 보면 이 500건 가까이를 통째로 놓친다.
+def failure_queue(db: sqlite3.Connection, target_kind: str | None = None) -> list[str]:
+    """재시도 대상. ``gone``과 상한 도달분은 빠진다 — 그것들은 정상 상태다."""
+    sql = ("SELECT target_key FROM collect_failures "
+           "WHERE kind = 'retriable' AND attempts < ?")
+    args: list = [MAX_ATTEMPTS]
+    if target_kind:
+        sql += " AND target_kind = ?"
+        args.append(target_kind)
+    return [r[0] for r in db.execute(sql, args)]
 
-**공포일과 법사위 처리일은 다르다.** 체계자구 심사 처리일을 공포일로 쓰면 안 된다. 공포는 정부이송 뒤에 오는 별도 단계다.
 
-**"통과했는데 공포가 없다"가 정상인 경우가 있다.** 결의안·동의안·감사요구안 같은 비법률 의안은 애초에 공포 대상이 아니다. 그래서 `bill_kind`가 결측 판정의 전제가 된다 — 우리는 이 값을 원천에서 직접 받으므로(billKindCd) 의안명에서 추정할 필요가 없다.
+def reset_retriable(db: sqlite3.Connection) -> int:
+    """파서를 고쳤을 때 상한 도달분을 되살린다 (``collect.py --retry all``)."""
+    cur = db.execute(
+        "UPDATE collect_failures SET attempts = 0 WHERE kind = 'retriable' AND attempts >= ?",
+        (MAX_ATTEMPTS,))
+    return cur.rowcount
 
-**대통령 거부권 후 재의결은 본회의 표결이 두 번이다.** `is_reexamination`(reexamYn)이 그 단서다. 두 표결이 다 오는지는 확인하지 못했다 — [07번](07-미해결-확인사항.md) 참조.
 
-**위원회 단계의 표결은 의원별로 공개되지 않는다.** `bill_stages.result`에 위원회 처리결과(가결/부결)는 있지만 누가 어떻게 표를 던졌는지는 없다. 의원별 표는 본회의뿐이다.
+# ═══════════════════════════════════════════════════════════════
+# selftest
+# ═══════════════════════════════════════════════════════════════
 
-**한 의안에 대표발의자가 둘 이상일 수 있다.** `bill_proposers.role`이 `대표발의`인 행이 하나뿐이라고 가정하지 마라.
+#: `.schema` 출력에 반드시 살아 있어야 할 경고 키워드.
+#:
+#: 스키마 주석이 이 프로젝트의 1차 인터페이스인데, 주석은 코드처럼 조용히 퇴행한다.
+#: 잠그는 것은 표현이 아니라 **경고의 존재**다 — 문장 전체를 대조하면 문구를 다듬을
+#: 때마다 깨져서 곧 무시하게 된다.
+#:
+#: ⚠️ DDL 소스가 아니라 `.schema` 출력을 검사한다. SQLite가 CREATE TABLE 앞의 주석을
+#:    버리므로 둘이 다르고, 소스를 보면 "주석은 있는데 클로드에게는 안 보이는" 상태를
+#:    통과시키게 된다. 그게 바로 이 테스트가 막으려는 상황이다.
+COMMENT_GUARDS = {
+    "meeting_utterances": "안건",
+    "bill_votes": "불참",
+    "members": "동명이인",
+    "bills": "영구키",
+    "committees": "자동 등록",
+    "bill_stages": "INSERT로 쌓는다",
+    "meetings": "국정감사",
+}
+
+
+def selftest(db_path: str) -> int:
+    p = Path(db_path)
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(p) + suffix).unlink(missing_ok=True)
+    db = connect(p)
+    init_schema(db)
+    fails: list[str] = []
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'}  {name}" + (f" — {detail}" if detail and not cond else ""))
+        if not cond:
+            fails.append(name)
+
+    print("congress db selftest")
+
+    # ── 구조
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    expected = {"committees", "members", "member_committees", "bills", "bill_stages",
+                "bill_proposers", "bill_vote_summary", "bill_votes", "bill_meetings",
+                "meetings", "meeting_speakers", "meeting_utterances", "meeting_agenda",
+                "collect_failures"}
+    check("테이블 14개", expected <= tables, str(sorted(expected - tables)))
+    check("뷰 없음", not {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='view'")})
+    check("FTS 없음", not any("_fts" in t for t in tables))
+    check("bills에 상태 컬럼 없음",
+          not ({r[1] for r in db.execute("PRAGMA table_info(bills)")} & {"detail_status", "status"}))
+    check("meeting_utterances에 bill_no 없음",
+          "bill_no" not in {r[1] for r in db.execute("PRAGMA table_info(meeting_utterances)")})
+    check("FK가 이 연결에서 켜져 있다", db.execute("PRAGMA foreign_keys").fetchone()[0] == 1)
+
+    # ── 주석 회귀: `.schema` 출력을 본다
+    schema_sql = {r[0]: r[1] for r in
+                  db.execute("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL AND type='table'")}
+    for tab, kw in COMMENT_GUARDS.items():
+        check(f"주석 생존 {tab}:{kw}", kw in schema_sql.get(tab, ""),
+              "괄호 밖에 있으면 .schema 에 안 나온다")
+
+    # ── 차원: 자동 등록과 first_seen_at 보존
+    upsert_committee(db, "정보통신방송법안심사소위원회",
+                     committee_class="소위원회", parent="과학기술정보방송통신위원회")
+    check("소위 등록이 상위 위원회를 먼저 만든다",
+          db.execute("SELECT COUNT(*) FROM committees").fetchone()[0] == 2)
+    first = db.execute("SELECT first_seen_at FROM committees WHERE committee_name = ?",
+                       ("과학기술정보방송통신위원회",)).fetchone()[0]
+    db.execute("UPDATE committees SET first_seen_at = '2000-01-01 00:00:00' "
+               "WHERE committee_name = '과학기술정보방송통신위원회'")
+    upsert_committee(db, "과학기술정보방송통신위원회", committee_class="상임위원회")
+    check("UPSERT가 first_seen_at을 덮어쓰지 않는다",
+          db.execute("SELECT first_seen_at FROM committees WHERE committee_name = ?",
+                     ("과학기술정보방송통신위원회",)).fetchone()[0] == "2000-01-01 00:00:00", first)
+    check("UPSERT가 committee_class는 보강한다",
+          db.execute("SELECT committee_class FROM committees WHERE committee_name = ?",
+                     ("과학기술정보방송통신위원회",)).fetchone()[0] == "상임위원회")
+
+    # ── 의원: 스텁 생성과 COALESCE 보강
+    upsert_member(db, "LEEHAIMIN", name="이해민", party="조국혁신당")
+    upsert_member(db, "LEEHAIMIN", name="이해민")          # 정보가 적은 원천이 나중에 온다
+    check("적은 정보로 다시 넣어도 정당이 안 지워진다",
+          db.execute("SELECT party FROM members WHERE open_na_id='LEEHAIMIN'").fetchone()[0]
+          == "조국혁신당")
+    upsert_member(db, "KIMHyun", name="김현", party="더불어민주당", is_incumbent=1)
+    upsert_member(db, "CHUNJAESOO", name="전재수", party="더불어민주당", is_incumbent=0)
+    check("mona_cd가 NULL이어도 들어간다 (전직 의원·시드 없음이 정상)",
+          db.execute("SELECT COUNT(*) FROM members WHERE mona_cd IS NULL").fetchone()[0] == 3)
+    upsert_member(db, "AAA", name="동명", mona_cd="X1")
+    try:
+        upsert_member(db, "BBB", name="동명", mona_cd="X1")
+        check("mona_cd UNIQUE가 중복을 막는다", False, "통과해 버렸다")
+    except sqlite3.IntegrityError:
+        check("mona_cd UNIQUE가 중복을 막는다", True)
+    check("동명이인이 다른 행으로 공존한다",
+          db.execute("SELECT COUNT(*) FROM members WHERE name='동명'").fetchone()[0] == 1)
+
+    # ── 의안: 목록 갱신이 상세를 지우지 않는다 (REPLACE 금지 회귀)
+    upsert_bill_list(db, {"bill_no": "2214631", "bill_id": "PRC_A", "assembly_unit": 22,
+                          "bill_kind": "법률안", "title": "소프트웨어 진흥법 일부개정법률안",
+                          "review_status": "위원회 심사"})
+    db.execute("UPDATE bills SET reason_text = '제안이유 본문', detail_collected_at = ? "
+               "WHERE bill_no = '2214631'", (now_str(),))
+    upsert_bill_list(db, {"bill_no": "2214631", "bill_id": "PRC_A", "assembly_unit": 22,
+                          "bill_kind": "법률안", "title": "소프트웨어 진흥법 일부개정법률안",
+                          "review_status": "본회의 통과"})
+    r = db.execute("SELECT reason_text, detail_collected_at, review_status "
+                   "FROM bills WHERE bill_no='2214631'").fetchone()
+    check("목록 재갱신이 reason_text를 보존한다", r["reason_text"] == "제안이유 본문")
+    check("목록 재갱신이 detail_collected_at을 보존한다", bool(r["detail_collected_at"]))
+    check("목록 재갱신이 변한 상태는 반영한다", r["review_status"] == "본회의 통과")
+    check("bills 행이 늘지 않았다",
+          db.execute("SELECT COUNT(*) FROM bills").fetchone()[0] == 1)
+
+    # ── bill_stages: 같은 단계를 다시 봐도 행이 안 는다
+    stage = dict(bill_no="2214631", stage="소관위", seq=1,
+                 committee_name="과학기술정보방송통신위원회", date_referred="2025-11-28")
+    for _ in range(3):
+        db.execute("""INSERT INTO bill_stages (bill_no, stage, seq, committee_name, date_referred)
+                      VALUES (:bill_no, :stage, :seq, :committee_name, :date_referred)
+                      ON CONFLICT(bill_no, stage, seq) DO UPDATE SET
+                          committee_name = excluded.committee_name,
+                          date_referred  = excluded.date_referred""", stage)
+    check("같은 단계를 세 번 넣어도 1행",
+          db.execute("SELECT COUNT(*) FROM bill_stages").fetchone()[0] == 1)
+
+    # ── CHECK 제약이 오타 상태값을 막는다
+    for sql, label in (
+            ("INSERT INTO bill_votes VALUES ('2214631','KIMHyun','찬성이')", "vote 오타 거부"),
+            ("INSERT INTO bill_proposers VALUES ('2214631','KIMHyun','대표빌의')", "role 오타 거부"),
+            ("INSERT INTO bill_stages (bill_no,stage) VALUES ('2214631','접수')", "stage 오타 거부"),
+            ("INSERT INTO collect_failures (target_kind,target_key,kind) "
+             "VALUES ('bill_detail','1','retriabel')", "kind 오타 거부")):
+        try:
+            db.execute(sql)
+            check(f"CHECK가 {label}", False, "통과해 버렸다")
+        except sqlite3.IntegrityError:
+            check(f"CHECK가 {label}", True)
+    # 위 거부가 정말 CHECK 때문이었는지 — 같은 키에 정상값이면 들어가야 한다
+    db.execute("INSERT INTO bill_votes VALUES ('2214631','KIMHyun','찬성')")
+    check("정상값은 통과한다 (앞의 거부가 FK가 아니었다)",
+          db.execute("SELECT COUNT(*) FROM bill_votes").fetchone()[0] == 1)
+
+    # ── FK: members에 없는 slug는 거부된다
+    try:
+        db.execute("INSERT INTO bill_votes VALUES ('2214631','NOBODY','찬성')")
+        check("FK가 모르는 slug를 거부한다", False, "통과해 버렸다")
+    except sqlite3.IntegrityError:
+        check("FK가 모르는 slug를 거부한다", True)
+
+    # ── meetings: committee_class CHECK 과 국정감사 NULL
+    upsert_committee(db, "국회운영위원회", committee_class="상임위원회")
+    db.execute("""INSERT INTO meetings (conference_id, assembly_unit, session_no, session_kind,
+                      sitting_no, committee_name, committee_class, is_subcommittee,
+                      date_meeting, collected_at)
+                  VALUES (51889, 22, NULL, NULL, NULL, '국회운영위원회', '국정감사', 0,
+                          '2024-10-07', ?)""", (now_str(),))
+    check("국정감사는 회기·차수가 NULL이어도 들어간다",
+          db.execute("SELECT COUNT(*) FROM meetings WHERE session_no IS NULL").fetchone()[0] == 1)
+    try:
+        db.execute("""INSERT INTO meetings (conference_id, assembly_unit, committee_name,
+                          committee_class, date_meeting, collected_at)
+                      VALUES (1, 22, '국회운영위원회', '본회의', '2026-01-01', ?)""", (now_str(),))
+        check("committee_class가 '본회의'를 거부한다", False, "통과해 버렸다")
+    except sqlite3.IntegrityError:
+        check("committee_class가 '본회의'를 거부한다", True)
+
+    # ── 자식 목록 교체: 부분 실패가 지우지 못한다
+    db.execute("INSERT INTO bill_proposers VALUES ('2214631','LEEHAIMIN','대표발의')")
+    db.execute("INSERT INTO bill_proposers VALUES ('2214631','KIMHyun','공동발의')")
+    for label, rows, expected_n in (
+            ("빈 목록", [], 2),
+            ("부분 목록(2 기대에 1행)", [dict(bill_no="2214631", open_na_id="LEEHAIMIN",
+                                              role="대표발의")], 2)):
+        try:
+            replace_children(db, "bill_proposers", "bill_no", "2214631", rows, expected=expected_n)
+            check(f"{label}이 거부된다", False, "통과해 버렸다")
+        except PartialListError:
+            check(f"{label}이 거부된다", True)
+    check("거부 후에도 기존 발의자가 남아 있다",
+          db.execute("SELECT COUNT(*) FROM bill_proposers").fetchone()[0] == 2)
+    n = replace_children(db, "bill_proposers", "bill_no", "2214631",
+                         [dict(bill_no="2214631", open_na_id="LEEHAIMIN", role="대표발의")],
+                         expected=1)
+    check("기대 건수와 맞으면 축소가 반영된다",
+          n == 1 and db.execute("SELECT COUNT(*) FROM bill_proposers").fetchone()[0] == 1)
+
+    # ── 실패 원장: 누적·상한·되살리기·성공 시 삭제
+    for _ in range(MAX_ATTEMPTS):
+        att = record_failure(db, "bill_detail", "2214631", detail="network:ReadTimeout")
+    check("attempts 누적", att == MAX_ATTEMPTS, str(att))
+    check("상한 도달분은 재시도 큐 밖", not failure_queue(db, "bill_detail"))
+    check("--retry all이 되살린다",
+          reset_retriable(db) == 1 and len(failure_queue(db, "bill_detail")) == 1)
+    record_failure(db, "meeting_body", "99999", kind="gone", detail="http:404")
+    check("gone은 재시도 큐에 없다", failure_queue(db, "meeting_body") == [])
+    clear_failure(db, "bill_detail", "2214631")
+    check("성공하면 원장에서 지워진다",
+          db.execute("SELECT COUNT(*) FROM collect_failures WHERE target_kind='bill_detail'")
+          .fetchone()[0] == 0)
+
+    # ── 판정자: 상세 미수집은 detail_collected_at 하나로 판정된다
+    upsert_bill_list(db, {"bill_no": "2200001", "bill_id": "PRC_B", "assembly_unit": 22,
+                          "bill_kind": "법률안", "title": "다른 법률안"})
+    check("detail_collected_at IS NULL이 미수집을 정확히 센다",
+          db.execute("SELECT COUNT(*) FROM bills WHERE bill_kind='법률안' "
+                     "AND detail_collected_at IS NULL").fetchone()[0] == 1)
+
+    # ── 멱등성: 같은 DB에 init_schema 를 다시 돌려도 터지지 않는다
+    try:
+        init_schema(db)
+        check("init_schema 재실행이 안전하다 (IF NOT EXISTS)", True)
+    except sqlite3.OperationalError as e:
+        check("init_schema 재실행이 안전하다 (IF NOT EXISTS)", False, str(e))
+
+    # ── 드리프트 감지가 실제로 작동한다
+    check("정상 DB에는 드리프트가 없다", schema_drift(db) == [], str(schema_drift(db)))
+    db.execute("ALTER TABLE bill_meetings RENAME TO bill_meetings_x")
+    db.execute("CREATE TABLE bill_meetings (bill_no TEXT, conference_id INTEGER)")  # 주석 없는 옛 정의 흉내
+    check("주석이 사라진 테이블을 드리프트로 잡는다", "bill_meetings" in schema_drift(db))
+
+    print(f"\n{'실패 ' + str(len(fails)) + '건: ' + ', '.join(fails) if fails else '전부 통과'}")
+    return 1 if fails else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", choices=["init", "schema", "selftest"])
+    ap.add_argument("--db", default=str(DB_PATH),
+                    help="기본값은 실제 CONGRESS.db다. selftest 는 대상을 지우므로 받지 않는다")
+    a = ap.parse_args()
+
+    if a.command == "selftest":
+        # **selftest 는 --db 를 반드시 받는다.** 이 함수의 첫 동작이 대상 .db/-wal/-shm 을
+        # 무조건 unlink 하는 것이라, 기본값이 실제 DB인 채로 인자를 잊으면 수집물이 통째로
+        # 사라진다. News 프로젝트에서 실제로 그렇게 4.25GB 를 잃었다 — 이름이 selftest 라
+        # 안전할 것이라고 넘겨짚고 사용법을 읽지 않은 것이 전부였다.
+        #
+        # 그래서 경고 문구가 아니라 **인자 자체를 필수로** 만든다.
+        # 문서는 안 읽히지만 인자는 안 주면 실행이 안 된다.
+        if "--db" not in sys.argv:
+            ap.error("selftest 는 --db 가 필수다 (대상을 지운다). 예: --db /tmp/t.db")
+        if Path(a.db).resolve() == DB_PATH.resolve():
+            ap.error("selftest 로 실제 CONGRESS.db 를 지목할 수 없다. 임시 경로를 써라.")
+        return selftest(a.db)
+
+    db = connect(a.db)
+    init_schema(db)
+    if a.command == "schema":
+        for r in db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"):
+            print(r[0], ";\n", sep="")
+        return 0
+
+    print(f"initialized {a.db}")
+    drift = schema_drift(db)
+    if drift:
+        print(f"\n⚠️  스키마 드리프트 {len(drift)}건: {', '.join(drift)}", file=sys.stderr)
+        print("   DDL이 IF NOT EXISTS 라서 이 DB에는 변경이 적용되지 않았다.", file=sys.stderr)
+        print("   .schema 로 읽히는 것은 옛 정의이므로 마이그레이션이 필요하다.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
