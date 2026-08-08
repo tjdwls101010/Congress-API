@@ -668,6 +668,10 @@ def record_failure(db: sqlite3.Connection, target_kind: str, target_key: str, *,
 
     ``detail``에 접두어를 붙여라 — ``network:``가 몰리면 전송 문제,
     ``parse:``가 몰리면 DOM 변경이나 파서 결함이다. 다음 조치가 달라진다.
+
+    ⚠️ **예외 타입만 적지 마라.** 한 함수가 서로 다른 이유로 같은 타입을 던지면
+       (예: 메타 파싱 실패와 "발언 0건"이 둘 다 ValueError) 원장이 둘을 구분하지
+       못해 진단이 한 걸음 늦는다. 메시지까지 넣어라 — 실제로 그렇게 헤맸다.
     """
     db.execute(
         """INSERT INTO collect_failures (target_kind, target_key, kind, detail, attempts, last_attempt_at)

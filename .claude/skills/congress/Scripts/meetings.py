@@ -95,12 +95,21 @@ def parse_meta(html: str) -> dict:
        성립하지 않는다 — 알려진 사각지대다.
     ⚠️ ``<h2>``가 여럿이고 **첫 번째가 비어 있는 경우가 있다**(국정감사). 그냥 `css_first`를
        쓰면 국정감사가 전부 파싱 실패로 떨어진다.
+    ⚠️ 더 나아가 **모든 ``h2``가 빈 응답도 온다.** 그래서 ``.tit`` → ``.minutes_header`` 까지
+       훑는다. 같은 문장이 세 자리에 있으므로 한 자리가 비어도 회의를 잃지 않는다.
     """
     tree = HTMLParser(html)
-    line = next((t for n in tree.css("h2") if (t := n.text(separator=" ", strip=True))), "")
-    m = META_RE.search(line)
+    # ⚠️ **h2 하나에 기대면 안 된다.** 같은 회의록이 h2 를 빈 채로 오는 경우가 실재한다
+    #    (실측: 54610 은 본문 .speaker 115개가 멀쩡한데 h2 만 비었다. 다시 받으면 들어 있다).
+    #    한 번 실패로 끝내면 그 회의가 재시도 큐를 거쳐야 하므로, 같은 문서 안의 대체 자리를
+    #    먼저 훑는다 — .tit 과 .minutes_header 에 같은 문장이 있다.
+    m = line = None
+    for node in [*tree.css("h2"), *tree.css(".tit"), *tree.css(".minutes_header")]:
+        line = node.text(separator=" ", strip=True)
+        if line and (m := META_RE.search(line)):
+            break
     if not m:
-        raise ValueError(f"메타 줄을 파싱하지 못했다: {line[:120]!r}")
+        raise ValueError(f"메타 줄을 파싱하지 못했다: {(line or '')[:120]!r}")
     g = m.groupdict()
     committee = g["committee"].strip()
 
@@ -170,25 +179,64 @@ def parse_body(html: str) -> tuple[list[dict], list[dict], list[dict]]:
     return speaker_rows, utterances, agenda
 
 
+#: 문서가 스스로 밝히는 자기 id. 본문의 PDF/XML 링크에 들어 있다.
+SELF_ID_RE = re.compile(r"(?:pdf|xml)\.do\?id=(\d+)")
+
+
+def fetch_body(session: net.Session, conference_id: int, tries: int = 4) -> str:
+    """회의록 본문. **받은 문서가 요청한 회의가 맞는지 검증한다.**
+
+    ⚠️ **같은 URL이 요청마다 다른 회의를 준다.** 실측(2026-08-09): ``id=56238``을
+       연속으로 네 번 받았더니 한 번은 ``56196``의 본문이 왔고, 다른 시각에는
+       ``제20대국회 … 국토교통위원회(2017)``가 왔다. 원천의 캐시 계층 문제로 보인다.
+
+       대수 판정만으로는 못 막는다 — **틀린 문서도 22대일 수 있고**(56238 → 56196),
+       그러면 그 회의의 위원회·회기·날짜·발언이 통째로 다른 회의 것으로 저장된다.
+       에러가 없고 행 수도 정상이라 감사에도 안 걸린다. 이 프로젝트에서 조용히 틀릴 수
+       있는 가장 위험한 자리다.
+
+       그래서 **문서가 스스로 밝히는 id와 대조한다.** 본문의 PDF/XML 링크가 그 값이다.
+    """
+    last = ""
+    for _ in range(tries):
+        r = session.get(f"{BODY}?id={conference_id}&type=view")
+        if r.status_code == 404:
+            raise FileNotFoundError(f"http:404 id={conference_id}")
+        r.raise_for_status()
+        last = r.text
+        found = set(SELF_ID_RE.findall(last))
+        if str(conference_id) in found:
+            return last
+        # 자기 id를 아예 안 밝히는 문서는 대조할 근거가 없으니 통과시킨다 —
+        # 잘못된 문서라고 단정할 수도 없다.
+        if not found:
+            return last
+    raise ValueError(f"다른 회의의 문서가 왔다 (요청 {conference_id} / 문서 "
+                     f"{sorted(set(SELF_ID_RE.findall(last)))[:3]})")
+
+
 def collect_one(db, session: net.Session, conference_id: int, committee_class: str) -> bool:
     """한 회의 = 한 트랜잭션. 갈라지면 "회의는 있는데 발언이 없는" 행이 남는다."""
     try:
-        r = session.get(f"{BODY}?id={conference_id}&type=view")
-        if r.status_code == 404:
-            dbm.record_failure(db, "meeting_body", conference_id, kind="gone", detail="http:404")
-            return False
-        r.raise_for_status()
+        html = fetch_body(session, conference_id)
+    except FileNotFoundError:
+        dbm.record_failure(db, "meeting_body", conference_id, kind="gone", detail="http:404")
+        return False
+    except ValueError as e:
+        dbm.record_failure(db, "meeting_body", conference_id, detail=f"mismatch:{e}"[:200])
+        return False
     except Exception as e:
         dbm.record_failure(db, "meeting_body", conference_id, detail=f"network:{type(e).__name__}")
         return False
 
     try:
-        meta = parse_meta(r.text)
-        speakers, utterances, agenda = parse_body(r.text)
+        meta = parse_meta(html)
+        speakers, utterances, agenda = parse_body(html)
         if not utterances:
             raise ValueError("발언이 0건이다 — 발언 없는 회의록은 없다")
     except Exception as e:
-        dbm.record_failure(db, "meeting_body", conference_id, detail=f"parse:{type(e).__name__}")
+        dbm.record_failure(db, "meeting_body", conference_id,
+                           detail=f"parse:{type(e).__name__}: {e}"[:200])
         return False
 
     # ⚠️ 22대가 아닌 회의가 트리에 섞여 올 수 있다. 대수는 본문 메타로 판정하고 버린다.
@@ -248,6 +296,8 @@ def main() -> int:
     ap.add_argument("--id", nargs="*", type=int, default=[], help="이 회의만 받는다")
     ap.add_argument("--enumerate-only", action="store_true", help="id 열거만 하고 본문은 안 받는다")
     ap.add_argument("--limit", type=int, help="본문 수집 상한 (시험용)")
+    ap.add_argument("--force", action="store_true",
+                    help="이미 받은 회의도 다시 받는다 (파서를 고쳤을 때)")
     ap.add_argument("--rate", type=float, default=net.DEFAULT_RATE)
     a = ap.parse_args()
 
@@ -264,7 +314,7 @@ def main() -> int:
                 return 0
             targets = {cid: CLASSES[cls] for cid, cls in ids.items()}
 
-        todo = [c for c in targets if not db.execute(
+        todo = list(targets) if a.force else [c for c in targets if not db.execute(
             "SELECT 1 FROM meeting_utterances WHERE conference_id=? LIMIT 1", (c,)).fetchone()]
         if a.limit:
             todo = todo[:a.limit]
