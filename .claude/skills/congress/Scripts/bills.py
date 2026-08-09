@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from selectolax.parser import HTMLParser
@@ -46,6 +48,25 @@ STAGE_BY_CAPTION = {
 #: 회의록 id 가 나오는 테이블들 → bill_meetings.stage
 MEETING_CAPTIONS = {"소관위 회의정보": "소관위", "법사위 회의정보": "체계자구",
                     "본회의 심의정보": "본회의"}
+
+#: ``<td class>`` → bill_stages 컬럼. **열 위치가 아니라 class 로 읽는다.**
+#:
+#: ⚠️ 열 위치로 읽으면 테이블마다 열 구성이 달라 조용히 어긋난다. 실측한 두 사고:
+#:    '본회의 심의정보'는 상정일·의결일·**회의명**·회의결과 순이라 셋째 칸을 처리결과로
+#:    읽으면 의결결과 자리에 회의명이 들어가고, '관련위 심사정보'는 처리결과 칸이 아예
+#:    없어(의견서제시일이 끝이다) 넷째 칸을 결과로 읽으면 '문서'가 들어간다.
+#:    원천은 값 칸마다 class 를 달아 두었고 그게 열 순서보다 안정적이다.
+STAGE_CELLS = {
+    "committeeName": "committee_name", "submitDt": "date_referred",
+    "presentDt": "date_presented", "inscResultCd": "result", "announceNo": "ref_no",
+    # 처리일의 이름이 단계마다 다르다: 처리일 · 의견서제시일 · 정부이송일 · 공포일자.
+    # 한 행에 둘이 함께 오는 경우는 없다.
+    "procDt": "date_processed", "govTransDt": "date_processed",
+    "announceDt": "date_processed",
+}
+
+#: 상세를 동시에 받는 워커 수. **실측으로 정했고 근거가 collect_details 주석에 있다.**
+DEFAULT_WORKERS = 6
 
 
 def fetch_list_page(session: net.Session, page: int, rows: int = 1000) -> list[dict]:
@@ -141,80 +162,109 @@ def parse_detail(html: str) -> dict:
     return {"fields": fields, "represent": slugs[0] if slugs else None}
 
 
+def cell_values(tr) -> dict[str, str]:
+    """한 행을 ``td class → 값``으로 접는다.
+
+    ⚠️ **``td.text()``를 그대로 쓰면 안 된다.** 값 칸이 전부
+       ``<td class="announceNo"><i>공포번호</i><span>20676</span></td>`` 모양이고
+       ``<i>``는 좁은 화면용 라벨이다. 그냥 읽으면 공포번호가 ``'공포번호 20676'``이
+       된다 — 실측으로 여섯 예제 전부 그렇게 들어갔다. 목록의 ``<i class="ico_kye">``
+       배지와 같은 계열이니, 이 사이트에서 ``<i>``는 일단 지우고 보는 게 맞다.
+    ⚠️ 지우는 것은 **직계 자식 ``<i>`` 뿐이다.** 통째로 지우면 문서 칸 안의 링크까지
+       날아갈 수 있고, 그 칸에 회의록 id 가 들어 있다.
+    ⚠️ 값은 ``<span>``에 있다. 라벨만 지우고 나머지를 다 읽으면 **UI 버튼 글자가 값에
+       붙는다** — 철회된 의안의 회의결과 칸이 ``<span>철회</span><a>철회자 목록</a>``이라
+       ``'철회 철회자 목록'``으로 들어갔고, 그러면 ``result = '철회'`` 조회가 그 의안을
+       놓친다. 노이즈를 하나씩 지우는 대신 **값 노드를 고른다** — 원천에 새 버튼이
+       붙어도 안 샌다. 직계 span 이 없는 칸(공포법률은 ``<a>``다)만 전체 텍스트로 떨어진다.
+    """
+    out: dict[str, str] = {}
+    for td in tr.css("td"):
+        cls = (td.attributes.get("class") or "").split()
+        if not cls:
+            continue
+        for label in [n for n in td.iter() if n.tag == "i"]:
+            label.decompose()
+        spans = [n for n in td.iter() if n.tag == "span"]
+        text = (" ".join(n.text(separator=" ", strip=True) for n in spans) if spans
+                else td.text(separator=" ", strip=True))
+        out[cls[0]] = re.sub(r"\s+", " ", text).strip() or None
+    return out
+
+
 def parse_info(html: str) -> tuple[list[dict], list[dict], dict]:
     """caption 테이블 → 심사 단계 · 회의 · bills 보강값."""
     tree = HTMLParser(html)
     stages, meetings, extra = [], [], {}
-    seq_by_stage: dict[str, int] = {}
 
     for table in tree.css("table"):
         cap = table.css_first("caption")
         if cap is None:
             continue
         head = re.split(r"\s*:", cap.text(strip=True))[0].strip()
-        rows = [[td.text(separator=" ", strip=True) for td in tr.css("td")]
-                for tr in table.css("tr") if tr.css("td")]
+        rows = [(tr, c) for tr in table.css("tr") if (c := cell_values(tr))]
         if not rows:
             continue
 
         if head == "의안접수정보":
-            c = rows[0]
-            if len(c) > 3:
-                extra["proposal_session"] = c[3]
-        elif head in MEETING_CAPTIONS:
-            for tr in table.css("tr"):
-                cells = [td.text(separator=" ", strip=True) for td in tr.css("td")]
-                if not cells:
-                    continue
+            extra["proposal_session"] = rows[0][1].get("sessionTitle")
+        elif head == "정부재의안":
+            # 재의(대통령 거부권) 결과의 **구조화된 원천**이다. 03번은 이 값이 오직
+            # bill_memo 산문에만 있다고 적었는데, 실측해 보니 caption 테이블이 따로 있고
+            # procResultName 칸이 '부결'을 그대로 준다(상법 2208496). 산문 정규식은
+            # 아래에 대비책으로만 남긴다.
+            extra["reconsideration_result"] = rows[0][1].get("procResultName")
+
+        if head in MEETING_CAPTIONS:
+            for tr, c in rows:
                 # 회의록 칸의 pdf.do?id= 가 회의록 본문 URL의 그 id다
                 link = tr.css_first('a[href*="pdf.do?id="]')
-                if link:
-                    cid = int(re.search(r"id=(\d+)", link.attributes["href"]).group(1))
-                    meetings.append({"conference_id": cid, "stage": MEETING_CAPTIONS[head],
-                                     "meeting_name": cells[0] if cells else None,
-                                     "date_meeting": cells[1] if len(cells) > 1 else None,
-                                     "result": cells[2] if len(cells) > 2 else None})
+                if link is None:
+                    continue
+                meetings.append({
+                    "conference_id": int(re.search(r"id=(\d+)",
+                                                   link.attributes["href"]).group(1)),
+                    "stage": MEETING_CAPTIONS[head],
+                    "meeting_name": c.get("mtngName"),
+                    # 본회의 심의정보에는 회의일(mtngDt) 칸이 없다 — 의결일이 그날이다
+                    "date_meeting": c.get("mtngDt") or c.get("procDt"),
+                    "result": c.get("procResultName") or c.get("inscResultCd"),
+                })
+
         if head not in STAGE_BY_CAPTION:
             continue
         stage = STAGE_BY_CAPTION[head]
-        for cells in rows:
-            # ⚠️ seq 를 파싱 순서로 매기면 원천이 행을 재정렬할 때 같은 사건이 다른 seq 를
-            #    받아 UPSERT 가 덮어쓰기가 아니라 삽입으로 동작한다. 그래서 committee+날짜로
-            #    정렬한 순위를 쓴다 — 아래에서 한 번에 매긴다.
+        for _tr, c in rows:
             row = {"stage": stage, "committee_name": None, "date_referred": None,
                    "date_presented": None, "date_processed": None, "result": None,
-                   "ref_no": None, "doc_url": None}
-            if stage in ("소관위", "소위", "관련위"):
-                row["committee_name"] = cells[0] if cells else None
-                row.update(zip(("date_referred", "date_presented", "date_processed", "result"),
-                               cells[1:5]))
-            elif stage == "체계자구":
-                row.update(zip(("date_referred", "date_presented", "date_processed", "result"),
-                               cells[0:4]))
-            elif stage == "본회의":
-                row.update(zip(("date_presented", "date_processed", "result"), cells[0:3]))
-            elif stage == "정부이송":
-                row["date_processed"] = cells[0] if cells else None
-            elif stage == "공포":
-                row["date_processed"] = cells[0] if cells else None
-                row["ref_no"] = cells[1] if len(cells) > 1 else None
-                if len(cells) > 2:
-                    # ⚠️ 공포법률명은 의안명과 다르다 — '…기본법안(대안)' → '…기본법'.
-                    #    바깥 자료와 이름으로 맞출 때 쓰는 것은 이쪽이다.
-                    extra["promulgated_law_name"] = cells[2]
+                   "ref_no": None, "doc_url": None, "seq": 1}
+            for cls, field in STAGE_CELLS.items():
+                if c.get(cls) is not None:
+                    row[field] = c[cls]
+            if name := c.get("lawName"):
+                # ⚠️ 공포법률명은 의안명과 다르다 — '…기본법안(대안)' → '…기본법'.
+                #    바깥 자료와 이름으로 맞출 때 쓰는 것은 이쪽이다.
+                extra["promulgated_law_name"] = name
             stages.append(row)
 
     # bill_memo — caption 테이블 **밖**이라 caption 매칭 파서로는 절대 못 잡는다.
-    # 재의결 결과가 오직 여기에만 있다.
     if memo := tree.css_first("pre.bill_memo"):
         extra["status_memo"] = memo.text(strip=True)
-        if r := re.search(r"재의(?:를 부친 결과|결과)[^.]*?(가결|부결)", extra["status_memo"]):
-            extra["reconsideration_result"] = r.group(1)
+        if not extra.get("reconsideration_result"):
+            if r := re.search(r"재의(?:를 부친 결과|결과)[^.]*?(가결|부결)", extra["status_memo"]):
+                extra["reconsideration_result"] = r.group(1)
 
-    for s in stages:
-        key = s["stage"]
-        seq_by_stage[key] = seq_by_stage.get(key, 0) + 1
-        s["seq"] = seq_by_stage[key]
+    # seq — **파싱 순서가 아니라 정렬 순위다.** 근거는 db.py 의 bill_stages.seq 주석:
+    # 보이는 순서대로 매기면 원천이 행을 재정렬하거나 앞에 끼워 넣는 순간 같은 사건이
+    # 다른 seq 를 받아 UPSERT 가 덮어쓰기 대신 **삽입**으로 동작한다 — 에러 없이 행만 는다.
+    # 관련위가 6행인 의안(2215928)이 실제로 이 규칙이 필요한 자리다.
+    for stage in {s["stage"] for s in stages}:
+        group = sorted((s for s in stages if s["stage"] == stage),
+                       key=lambda s: (s["date_referred"] or s["date_presented"]
+                                      or s["date_processed"] or "",
+                                      s["committee_name"] or ""))
+        for i, s in enumerate(group, 1):
+            s["seq"] = i
     return stages, meetings, extra
 
 
@@ -389,6 +439,56 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
     return True
 
 
+def collect_details(db_path: str, todo: list[tuple[str, str]], *,
+                    rate: float = net.DEFAULT_RATE,
+                    workers: int = DEFAULT_WORKERS) -> tuple[int, int]:
+    """상세를 **동시에** 받는다. 워커마다 자기 ``net.Session``과 자기 DB 연결을 갖는다.
+
+    수집 전체에서 동시성이 여기에만 있다. 다른 단계는 목록 21요청·트리 70요청·본문
+    2,056건이라 순차로 분 단위에 끝나는데, 상세만 2만 건 × 약 3.5요청이다.
+
+    ⚠️ **rps 는 손잡이가 아니었다.** 04번은 2/4/6/8 rps 를 재라고 하는데, 재 보니 네
+       값의 총시간이 전부 같다(200건에 93~106초). 요청이 순차라 왕복 지연 0.5초가
+       상한이어서 레이트리밋이 애초에 걸리지 않는다 — 실제 처리량은 어느 설정에서든
+       ~1.9/s 였다. 실제로 듣는 손잡이는 **동시 연결 수**다.
+    ⚠️ **6은 실측한 무릎 바로 아래다.** 동시성 1·2·4·6 은 처리량이 선형으로 붙으면서
+       중앙 지연이 0.52s 로 그대로인데(11.2/s), 8 에서 처리량이 12.1/s 로 멎으면서
+       중앙 지연이 0.63s·p90 0.77s 로 오른다 — 서버가 병렬로 처리하지 않고 큐에
+       쌓기 시작하는 지점이다. 실패는 전 구간 0이었다.
+       참고로 HTTP/1.1 브라우저가 호스트당 여는 연결이 정확히 6이다.
+    ⚠️ **sqlite3 연결은 스레드를 넘지 못한다** — 워커마다 ``connect()`` 한다.
+       WAL 이라 읽기는 겹치고 쓰기는 ``busy_timeout``(30초)으로 직렬화된다. 한 의안의
+       트랜잭션이 밀리초 단위라 6워커에서 경합이 사실상 없고, 밀려서 실패해도 원장이
+       받아 다음 패스가 회수한다. 스키마 생성은 호출자가 미리 한 번만 한다.
+    """
+    done = ok = 0
+    lock = threading.Lock()
+
+    def run(chunk: list[tuple[str, str]]) -> int:
+        nonlocal done, ok
+        db = dbm.connect(db_path)
+        try:
+            with net.Session(rate=rate) as s:
+                for bn, bid in chunk:
+                    good = collect_detail(db, s, bn, bid)
+                    with lock:
+                        done += 1
+                        ok += good
+                        if done % 500 == 0 or done == len(todo):
+                            print(f"    {done:>6,d}/{len(todo):,}  성공 {ok:,}  "
+                                  f"실패 {done - ok:,}", flush=True)
+        finally:
+            db.close()
+        return 0
+
+    # 라운드로빈으로 나눈다 — 앞뒤 의안의 무게가 달라(표결·발의자 유무) 연속 덩어리로
+    # 자르면 한 워커만 늦게 끝난다.
+    chunks = [todo[i::workers] for i in range(workers)]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(run, [c for c in chunks if c]))
+    return ok, len(todo) - ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -397,29 +497,31 @@ def main() -> int:
     ap.add_argument("--bill-id", nargs="*", default=[], help="이 billId 만 상세 수집")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--rate", type=float, default=net.DEFAULT_RATE)
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="상세 동시 수집 수")
     a = ap.parse_args()
 
     db = dbm.connect(a.db)
     dbm.init_schema(db)
-    with net.Session(rate=a.rate) as s:
-        if not a.bill_id:
+    if not a.bill_id:
+        # 목록은 21요청뿐이라 순차로 둔다. 동시성이 필요한 것은 상세뿐이다.
+        with net.Session(rate=a.rate) as s:
             print("의안 목록:")
             print(f"  총 {collect_list(db, s):,}행")
-            if a.list_only:
-                return 0
-            todo = [(r[0], r[1]) for r in db.execute(
-                "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
-                "AND (bill_kind = '법률안' OR bill_kind = '미상')")]
-        else:
-            todo = [(db.execute("SELECT bill_no FROM bills WHERE bill_id=?", (b,)).fetchone()[0], b)
-                    if db.execute("SELECT 1 FROM bills WHERE bill_id=?", (b,)).fetchone()
-                    else (None, b) for b in a.bill_id]
-            todo = [t for t in todo if t[0]]
-        if a.limit:
-            todo = todo[:a.limit]
-        print(f"상세 수집 대상 {len(todo):,}건")
-        ok = sum(collect_detail(db, s, bn, bid) for bn, bid in todo)
-        print(f"  성공 {ok:,} / 실패 {len(todo) - ok:,}")
+        if a.list_only:
+            return 0
+        todo = [(r[0], r[1]) for r in db.execute(
+            "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
+            "AND (bill_kind = '법률안' OR bill_kind = '미상')")]
+    else:
+        todo = [(db.execute("SELECT bill_no FROM bills WHERE bill_id=?", (b,)).fetchone()[0], b)
+                if db.execute("SELECT 1 FROM bills WHERE bill_id=?", (b,)).fetchone()
+                else (None, b) for b in a.bill_id]
+        todo = [t for t in todo if t[0]]
+    if a.limit:
+        todo = todo[:a.limit]
+    print(f"상세 수집 대상 {len(todo):,}건 (동시 {a.workers})")
+    ok, bad = collect_details(a.db, todo, rate=a.rate, workers=a.workers)
+    print(f"  성공 {ok:,} / 실패 {bad:,}")
     return 0
 
 

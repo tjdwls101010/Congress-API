@@ -60,6 +60,8 @@ def main() -> int:
     ap.add_argument("--only", choices=["members", "bills", "meetings"], action="append")
     ap.add_argument("--retry", choices=["all"], help="상한 도달분을 되살린다")
     ap.add_argument("--rate", type=float, default=net.DEFAULT_RATE, help="초당 요청 수")
+    ap.add_argument("--workers", type=int, default=bills.DEFAULT_WORKERS,
+                    help="의안 상세 동시 수집 수 (실측 기본 6)")
     ap.add_argument("--limit", type=int, help="도메인마다 이 건수까지만 (시험용)")
     a = ap.parse_args()
 
@@ -92,9 +94,9 @@ def main() -> int:
                 todo = [(r[0], r[1]) for r in db.execute(
                     "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
                     "AND bill_kind IN ('법률안','미상')")][:a.limit or None]
-                print(f"의안 상세 {len(todo):,}건")
-                for bn, bid in todo:
-                    bills.collect_detail(db, s, bn, bid)
+                print(f"의안 상세 {len(todo):,}건 (동시 {a.workers})")
+                # 수집 전체에서 여기만 동시로 돈다 — 근거는 bills.collect_details 주석.
+                bills.collect_details(a.db, todo, rate=a.rate, workers=a.workers)
             if "meetings" in only:
                 print("회의록 열거:")
                 ids = meetings.enumerate_ids(s)
