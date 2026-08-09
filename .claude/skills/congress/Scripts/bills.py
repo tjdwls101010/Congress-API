@@ -319,18 +319,28 @@ def parse_votes(html: str) -> tuple[dict, list[dict], int]:
 def parse_proposers(html: str, represent: str | None) -> list[dict]:
     """발의자 명단. 대표발의는 상세 페이지 카드가 정하고 나머지는 공동발의다.
 
-    한글명·한자명·정당을 한 번에 준다 — ``이해민 李海珉 조국혁신당``.
-    표결 명단은 이름만 주니 여기서 만난 의원이 훨씬 잘 채워진다.
+    한글명·한자명·정당을 한 번에 준다. 표결 명단은 이름만 주고 의원 상세는 1인 1요청이라,
+    정당이 공짜로 오는 자리가 여기다.
+
+    ⚠️ **앵커 *뒤*의 텍스트를 읽으면 안 된다.** 한 명이 사진 카드로 오고 값은 앵커 *안*에 있다:
+
+        <a href=".../members/22nd/LEEHAIMIN"><div><img></div>
+           <p>이해민</p><p>李海珉</p><p class="jdang">조국혁신당</p></a>
+
+       앵커 다음 텍스트를 잡는 정규식은 ``<div>`` 앞의 공백만 집어 **이름·한자·정당이
+       전부 None 으로 들어간다.** 200 이고 발의자 수도 맞아서 어디서도 안 걸린다 —
+       실측에서 의원 332명 **전원**의 party 가 NULL 이었던 원인이 이것이다.
     """
     out = []
-    for m in re.finditer(r'href="[^"]*/members/22nd/(\w+)"[^>]*>\s*([^<]*)', html):
-        slug, label = m.group(1), re.sub(r"\s+", " ", m.group(2)).strip()
-        parts = label.split()
+    for a in HTMLParser(html).css('a[href*="/members/22nd/"]'):
+        slug = a.attributes["href"].rstrip("/").split("/")[-1]
+        party = next((p.text(strip=True) for p in a.css("p.jdang")), None)
+        plain = [t for p in a.css("p") if (t := p.text(strip=True)) and t != party]
         out.append({"open_na_id": slug,
                     "role": "대표발의" if slug == represent else "공동발의",
-                    "name": parts[0] if parts else None,
-                    "name_hanja": parts[1] if len(parts) > 1 else None,
-                    "party": parts[2] if len(parts) > 2 else None})
+                    "name": plain[0] if plain else None,
+                    "name_hanja": plain[1] if len(plain) > 1 else None,
+                    "party": party})
     return list({p["open_na_id"]: p for p in out}.values())
 
 
