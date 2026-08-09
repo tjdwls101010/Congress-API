@@ -894,6 +894,20 @@ def failure_queue(db: sqlite3.Connection, target_kind: str | None = None) -> lis
     return [r[0] for r in db.execute(sql, args)]
 
 
+def retry_queue(db: sqlite3.Connection, target_kind: str) -> set[str]:
+    """다시 시도해야 할 대상 키들 — **원장이 곧 재시도 큐다.**
+
+    ⚠️ "이미 받았는가"만으로 할 일을 정하면 안 된다. 한 번 성공한 뒤의 재수집이 실패하면
+       (원천 플래핑, 락 경합, 일시적 5xx) 데이터는 남아 있으므로 "받았다"로 보이는데
+       원장에는 실패가 남는다. 그러면 그 항목은 **영영 재시도되지 않고** 게이트
+       ``unresolved_retriable`` 이 영구히 빨갛다 — 이 파일이 가장 경계하는 상태다.
+       실측으로 그렇게 4건이 물렸다(회의 52429·52705·55411·55813).
+    """
+    return {r[0] for r in db.execute(
+        "SELECT target_key FROM collect_failures WHERE target_kind = ? "
+        "AND kind = 'retriable' AND attempts < ?", (target_kind, MAX_ATTEMPTS))}
+
+
 def reset_retriable(db: sqlite3.Connection) -> int:
     """파서를 고쳤을 때 상한 도달분을 되살린다 (``collect.py --retry all``)."""
     cur = db.execute(
