@@ -1,18 +1,29 @@
-# 정기 수집 — 하루 1회 새벽(KST).
+# CONGRESS.db 를 하루 1회 자동으로 채운다. 코드는 GitHub 이 아니라 **내 맥에서** 돈다.
 #
-# runs-on: self-hosted 인 이유는 DB가 로컬 파일이라서다. 클라우드 러너에는 그 파일이 없다.
-# GitHub은 크론·로그·알림만 맡고 실행은 맥이 한다.
+# 왜 self-hosted 러너인가: 수집 대상 DB 가 로컬 SQLite 파일이다. 클라우드 러너에는 그 파일이
+#   없고 매번 올렸다 내리는 것은 말이 안 된다. GitHub 은 크론·로그·알림만 맡는다.
+#   러너: `~/actions-runner-congress-api` (`congress-api-seongjin-mac`).
+#   ⚠️ `~/actions-runner-congress` 는 **이 저장소가 아니다** — 지금도 살아 돌고 있는
+#      Congress-DB 소속이므로 건드리지 마라.
 #
-# ⚠️ 이 저장소에 등록된 self-hosted 러너가 있어야 한다. ~/actions-runner-congress 가
-#    이미 있어도 그것은 폐기한 Congress-DB 소속이므로 이 저장소에는 잡히지 않는다.
-#    러너가 없으면 예약 run 이 24시간 큐에 걸렸다가 cancelled 로 사라지는데,
-#    **취소는 실패가 아니라서 알림이 가지 않는다.** collect-watchdog.yml 이 그걸 잡는다.
+# ⚠️ **DB 는 체크아웃 안이 아니라 실제 경로를 겨눈다.** actions/checkout 은 기본으로
+#    `git clean -ffdx` 를 도는데 `-x` 가 **gitignore 된 파일까지 지운다** — 작업공간에
+#    DB 를 두면 매 실행 첫 스텝이 수집물을 통째로 날린다. 에러 없이, 조용히.
+#    체크아웃은 코드 운반체일 뿐이다. 뒤집으면, main 에 머지하지 않은 수정은 예약
+#    실행에 반영되지 않는다 — 새벽에 작업 브랜치의 미완성 코드가 도는 일이 없다.
+#
+# 제약:
+#   - 스케줄 워크플로는 default 브랜치(main)에 있어야 발동한다.
+#   - GitHub 크론은 UTC·best-effort 다(수~수십 분 지연, 부하 시 건너뜀).
+#   - 저장소가 60일간 활동이 없으면 스케줄이 자동 비활성화된다.
+#   - 잡이 24시간 넘게 큐에 있으면 GitHub 이 취소한다(맥 장기 부재). **취소는 실패가
+#     아니라 알림이 가지 않는다** — 그래서 collect-watchdog.yml 이 따로 있다.
 name: scheduled-collect
 
 on:
   schedule:
     - cron: "0 19 * * *"   # 04:00 KST
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 # 예약 run 끼리 직렬화한다. 스크립트에도 파일 락이 있지만(손실행까지 막아야 하므로)
 # 여기서 막으면 애초에 러너를 점유하지 않는다.
@@ -20,17 +31,77 @@ concurrency:
   group: congress-collect
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   collect:
     runs-on: self-hosted
+    # 의안 상세 백필이 가장 길다(2만 건, 동시 6으로 약 1.5시간). 따라잡기는 더 길 수 있어
+    # 넉넉히 준다. 평소 증분은 몇 분이면 끝난다.
     timeout-minutes: 720
+    env:
+      CONGRESS_DB: /Users/seongjin/Coding/Congress API/.claude/skills/congress/CONGRESS.db
+
     steps:
       - uses: actions/checkout@v4
-      - name: 수집
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # `uv sync` 가 없는 것이 맞다. 스크립트가 PEP 723 인라인 의존성을 선언하므로
+      # `uv run` 만으로 해결된다. 저장소에 pyproject.toml 이 없다.
+      - name: Collect
+        id: collect
         run: |
-          uv run .claude/skills/congress/Scripts/collect.py --rate 4 | tee /tmp/collect.json
-      - name: 불변조건 요약
+          set +e   # 종료코드 1이 "게이트 위반"이라는 신호다. 셸이 먼저 죽으면 안 된다
+          uv run .claude/skills/congress/Scripts/collect.py --db "$CONGRESS_DB" > result.json
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+        # ⚠️ 파이프(`| tee`)를 쓰지 마라. 셸이 **마지막 명령의** 종료코드를 돌려주므로
+        #    collect.py 의 1이 tee 의 0으로 덮여 빨간불 설계가 통째로 무력해진다.
+
+      # 진행 로그는 stderr 로 수백 줄이 나가고 그대로는 읽을 수가 없다. 판정은 stdout
+      # JSON 한 장에 다 있으므로 그것을 표로 접는다.
+      - name: Summary
         if: always()
         run: |
-          uv run .claude/skills/congress/Scripts/audit.py \
-            --db .claude/skills/congress/CONGRESS.db >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+
+          try:
+              d = json.loads(pathlib.Path("result.json").read_text())
+          except Exception as e:
+              print(f"## 수집 결과를 읽지 못했다\n\n`{e}` — 위 로그를 직접 본다.")
+              raise SystemExit
+
+          if d.get("skipped"):
+              # 먼저 잡은 실행을 선점하지 않는다. 실패가 아니다 — 다음 실행이 따라잡는다.
+              print(f"## 건너뜀\n\n{d['skipped']}\n")
+              raise SystemExit
+
+          inv = d.get("invariants", {})
+          print(f"## {'수집 정상' if d.get('ok') else '게이트 위반'}\n")
+
+          for label, want in (("게이트 — 하나라도 fail 이면 실행이 실패다", ("pass", "fail")),
+                              ("판정 보류 — 대조할 근거가 없다(실패가 아니다)", ("skip",)),
+                              ("보고값 — 실패 기준이 아니다. 튀면 신호다", (None,))):
+              rows = [(k, v) for k, v in inv.items()
+                      if (v.get("status") in want if want != (None,)
+                          else v.get("status") not in ("pass", "fail", "skip"))]
+              if not rows:
+                  continue
+              print(f"### {label}\n")
+              print("| | 값 | |\n|---|---:|---|")
+              for k, v in rows:
+                  mark = {"pass": "✅", "fail": "❌", "skip": "⏸"}.get(v.get("status"), "")
+                  print(f"| `{k}` | {v.get('value')} | {mark} {v.get('desc', '')} |")
+              print()
+          PY
+
+      - name: Fail if invariants violated
+        if: always() && steps.collect.outputs.code != '0'
+        run: |
+          echo "::error::게이트 위반 — 위 요약의 ❌ 항목을 보라 (종료코드 ${{ steps.collect.outputs.code }})"
+          exit 1
