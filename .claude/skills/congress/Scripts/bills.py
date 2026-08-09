@@ -254,6 +254,18 @@ def parse_info(html: str) -> tuple[list[dict], list[dict], dict]:
             if r := re.search(r"재의(?:를 부친 결과|결과)[^.]*?(가결|부결)", extra["status_memo"]):
                 extra["reconsideration_result"] = r.group(1)
 
+    # 소위 단계의 위원회 이름을 소관위로 수식한다 — meetings.parse_meta 와 같은 규칙이다.
+    # ⚠️ 원천은 소위 심사정보 칸에 소위 이름만 주는데 그 이름은 상위 위원회를 넘어 중복된다
+    #    ('법안심사제1소위원회'는 법사위·행안위·복지위·정무위에 다 있다). 맨 이름으로 넣으면
+    #    회의록 쪽이 만든 수식된 이름과 갈라져 같은 소위가 committees 에 두 행이 되고,
+    #    "이 소위를 거친 법안"과 "이 소위의 회의"가 서로 다른 위원회를 가리키게 된다.
+    #    같은 문서 안의 소관위가 곧 그 소위의 상위다.
+    if owner := next((s["committee_name"] for s in stages if s["stage"] == "소관위"), None):
+        for s in stages:
+            if s["stage"] == "소위" and s["committee_name"]:
+                s["parent"] = owner
+                s["committee_name"] = f"{owner} {s['committee_name']}"
+
     # seq — **파싱 순서가 아니라 정렬 순위다.** 근거는 db.py 의 bill_stages.seq 주석:
     # 보이는 순서대로 매기면 원천이 행을 재정렬하거나 앞에 끼워 넣는 순간 같은 사건이
     # 다른 seq 를 받아 UPSERT 가 덮어쓰기 대신 **삽입**으로 동작한다 — 에러 없이 행만 는다.
@@ -382,7 +394,11 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
         db.execute(f"UPDATE bills SET {sets} WHERE bill_no = ?", [*extra.values(), bill_no])
         for st in stages:
             if st["committee_name"]:
-                dbm.upsert_committee(db, st["committee_name"])
+                # 돌려받은 표기를 쓴다 — 원천마다 공백이 달라 다른 이름으로 넣으면 FK 위반이다
+                st["committee_name"] = dbm.upsert_committee(
+                    db, st["committee_name"],
+                    committee_class="소위원회" if st["stage"] == "소위" else None,
+                    parent=st.get("parent"))
             db.execute("""INSERT INTO bill_stages (bill_no, stage, seq, committee_name,
                               date_referred, date_presented, date_processed, result, ref_no, doc_url)
                           VALUES (?,?,?,?,?,?,?,?,?,?)

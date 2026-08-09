@@ -121,6 +121,16 @@ def parse_meta(html: str) -> dict:
     parent = None
     if (sub := re.fullmatch(r"(.+?)\(([^()]+)\)", committee)):
         parent, committee = sub.group(1).strip(), sub.group(2).strip()
+        # ── 저장하는 이름을 상위 위원회로 수식한다: '법제사법위원회 법안심사제1소위원회'
+        #    ⚠️ **소위 이름은 상위를 넘어 중복된다.** '법안심사제1소위원회'는 법사위·행안위·
+        #       복지위·정무위에 전부 있고(실측: 123회 중 표본 12개가 상위 4곳), '예산결산기금
+        #       심사소위원회'는 상위 5곳이었다. 이름만으로 키를 잡으면 **서로 다른 위원회가
+        #       committees 한 행으로 접히고**, parent_committee 는 마지막에 본 것이 이긴다.
+        #       그 상태로 "보건복지위 법안심사제1소위 회의"를 물으면 법사위·행안위 회의까지
+        #       섞인 답이 조용히 나온다 — 에러가 없어서 아무도 알아채지 못한다.
+        #    수식하면 단일 컬럼 PK 와 FK 를 그대로 둔 채 실제 위원회 하나가 행 하나가 된다.
+        #    상위만 따로 쓰려면 parent_committee 컬럼이 그대로 있다.
+        committee = f"{parent} {committee}"
 
     return {
         "assembly_unit": int(g["unit"]),
@@ -262,9 +272,11 @@ def collect_one(db, session: net.Session, conference_id: int, committee_class: s
 
     db.execute("BEGIN")
     try:
-        dbm.upsert_committee(db, meta["committee_name"],
-                             committee_class="소위원회" if meta["is_subcommittee"] else committee_class,
-                             parent=meta["parent_committee"])
+        # 돌려받은 표기를 쓴다 — 원천마다 공백이 달라 다른 이름으로 넣으면 FK 위반이다
+        meta["committee_name"] = dbm.upsert_committee(
+            db, meta["committee_name"],
+            committee_class="소위원회" if meta["is_subcommittee"] else committee_class,
+            parent=meta["parent_committee"])
         db.execute("""INSERT INTO meetings (conference_id, assembly_unit, session_no, session_kind,
                           sitting_no, committee_name, committee_class, is_subcommittee,
                           date_meeting, pdf_url, collected_at)
