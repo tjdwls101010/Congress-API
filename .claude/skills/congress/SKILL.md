@@ -75,6 +75,8 @@ decision_result IN ('원안가결','수정가결')
 
 **`bill_votes`에 행이 없는 것은 불참이 아니다.** 원천이 찬성·반대·기권 명단만 주고 불참자 명단은 주지 않는다. 불참 수는 `bill_vote_summary`의 재적·재석으로 **계산**하고, 명단으로 유도하지 마라.
 
+**소위원회 이름은 `상위 위원회 + 공백 + 소위명`이다.** `WHERE committee_name = '법안심사제1소위원회'`는 **0건**을 준다 — 저장된 이름이 `'법제사법위원회 법안심사제1소위원회'`이기 때문이다. 소위 이름이 위원회를 넘어 중복되기 때문에(`법안심사제1소위원회`는 법사위·행안위·복지위·정무위에 전부 있다) 이렇게 두지 않으면 한 행이 여러 위원회를 겸한다. 어떤 위원회의 소위를 전부 보려면 `parent_committee`로 걸러라.
+
 **안건과 발언을 잇지 마라.** 회의에 어떤 안건이 상정됐는지는 알지만 개별 발언이 어느 안건에 대한 것인지는 알 수 없다. 의원마다 질의 순서가 다르고 안건을 하나씩 끝내는 방식이 아니다.
 
 **발언에서 의원까지는 두 홉이다.** `meeting_utterances.speaker_no` → `meeting_speakers` → `open_na_id`. 그 사이 `speaker_no`는 사람의 식별자가 아니라 회의 안의 자리번호이고, **회의 밖에서 참조하면 안 된다.** 화자의 42%가 의원이 아니라서(차관·청장·전문위원) 이 단계가 필요하다.
@@ -91,6 +93,9 @@ decision_result IN ('원안가결','수정가결')
 uv run {skill_dir}/Scripts/db.py schema --db …        # .schema 출력
 uv run {skill_dir}/Scripts/db.py selftest --db /tmp/t.db   # ⚠️ 대상 DB를 지운다
 uv run {skill_dir}/Scripts/audit.py --db …            # 불변조건만
+uv run {skill_dir}/Scripts/verify.py                  # 국회 사이트가 바뀌었나 (DB를 안 본다)
 ```
+
+**수집이 조용히 빈손으로 오면 파서를 뜯기 전에 `verify.py`를 돌려라.** `selftest`는 우리 코드의 회귀를 잡고(네트워크 없음), `verify.py`는 원천이 바뀌었는지를 실데이터로 본다(DB 없음). 둘은 다른 질문에 답한다.
 
 > ⚠️ **`selftest`는 `--db`가 필수이고 실제 `CONGRESS.db`를 지목하면 거부한다.** 첫 동작이 대상 파일 삭제라서, 기본값이 실제 DB인 채로 인자를 잊으면 수집물이 통째로 사라진다. News 프로젝트에서 실제로 그렇게 4.25GB를 잃었다.
