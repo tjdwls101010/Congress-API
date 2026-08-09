@@ -582,6 +582,112 @@ def migrate_comments(db: sqlite3.Connection) -> list[str]:
     return structural
 
 
+def consolidate_committees(db: sqlite3.Connection) -> list[tuple[str, str]]:
+    """공백·중점만 다른 위원회 행들을 하나로 합치고, 합친 쌍을 돌려준다.
+
+    ``upsert_committee``는 **새로** 갈라지는 것만 막는다 — 이미 두 행이 되어 있으면
+    각자 자식을 거느린 채로 남는다. 그 상태에서 "이 위원회를 거친 것 전부"는 조용히
+    절반만 준다. 감사의 ``committee_near_dupes``가 그걸 세고, 이 함수가 치운다.
+
+    ⚠️ **자동으로 돌리지 않는다.** 데이터를 다시 쓰는 연산이라 사람이 값을 보고
+       불러야 한다: ``uv run db.py consolidate --db …``
+    ⚠️ 남길 표기는 **먼저 본 것**(``first_seen_at``)이다. 어느 쪽이 옳은지 판정할 근거가
+       원천에 없다 — likms 는 '기후위기 특별위원회', record 는 '기후위기특별위원회'로
+       적고 둘 다 그 사이트의 정식 표기다. 그래서 옳음이 아니라 **하나로 모으는 것**만
+       보장한다.
+    """
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for name, seen in db.execute(
+            "SELECT committee_name, first_seen_at FROM committees ORDER BY first_seen_at, committee_name"):
+        key = name.replace(" ", "").replace("·", "").replace("ㆍ", "")
+        groups.setdefault(key, []).append((name, seen))
+
+    merged: list[tuple[str, str]] = []
+    db.execute("BEGIN")
+    try:
+        for members_ in groups.values():
+            if len(members_) < 2:
+                continue
+            keep = members_[0][0]
+            for drop, _ in members_[1:]:
+                for table, col in (("meetings", "committee_name"),
+                                   ("bill_stages", "committee_name"),
+                                   ("member_committees", "committee_name"),
+                                   ("committees", "parent_committee")):
+                    db.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?", (keep, drop))
+                # 버리는 쪽만 알고 있던 값은 남기는 쪽으로 옮긴다
+                db.execute("""UPDATE committees SET
+                                  committee_class = COALESCE(committee_class,
+                                      (SELECT committee_class FROM committees WHERE committee_name=?)),
+                                  parent_committee = COALESCE(parent_committee,
+                                      (SELECT parent_committee FROM committees WHERE committee_name=?))
+                              WHERE committee_name = ?""", (drop, drop, keep))
+                db.execute("DELETE FROM committees WHERE committee_name = ?", (drop,))
+                merged.append((drop, keep))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return merged
+
+
+def merge_dead_member_slugs(db: sqlite3.Connection) -> tuple[list[tuple[str, str]], list[str]]:
+    """상세가 404인 slug 를 같은 이름의 살아 있는 slug 로 합친다. ``(합친 쌍, 지운 잔재)``.
+
+    **두 호스트가 같은 의원을 다르게 로마자화한다.** record 의 회의록은
+    ``/members/22nd/JUNGHYEKYUNG`` 으로 링크하는데 www 의 실제 slug 는
+    ``JEONGHYEKYEONG`` 이고 앞의 것은 404다. 그러면 한 사람이 두 행이 되고,
+    "그 의원의 발언"과 "그 의원의 발의 법안"이 **서로 다른 PK** 를 가리켜 조인이
+    조용히 절반만 준다. 실측 3명: 정혜경 · 권향엽 · 김윤덕.
+
+    ⚠️ **이름만으로 합치면 안 된다 — 동명이인이 실재한다.** 22대에 박지원이 둘이다
+       (``PARKJIEWON`` 5선 전남 해남완도진도 / ``PARKJIWON`` 초선 전북 군산김제부안을).
+       둘 다 상세가 200이다. 그래서 **죽은 slug(상세 404)만** 합치기 대상으로 본다 —
+       실재하는 사람은 언제나 살아 있는 페이지를 가진다.
+    ⚠️ 살아 있는 동명이 정확히 하나일 때만 합친다. 둘 이상이면 사람이 봐야 한다.
+
+    참조가 하나도 없는 죽은 행은 잔재다 — 원천 플래핑으로 다른 대수 회의록이 들어왔던
+    시절에 만들어진 21대 의원들이다. 그건 지운다.
+    """
+    dead = {r[0] for r in db.execute(
+        "SELECT target_key FROM collect_failures WHERE target_kind='member' AND kind='gone'")}
+    merged: list[tuple[str, str]] = []
+    dropped: list[str] = []
+    db.execute("BEGIN")
+    try:
+        for slug in sorted(dead):
+            row = db.execute("SELECT name FROM members WHERE open_na_id=?", (slug,)).fetchone()
+            if row is None:
+                continue
+            live = [r[0] for r in db.execute(
+                "SELECT open_na_id FROM members WHERE name=? AND open_na_id<>?",
+                (row[0], slug)) if r[0] not in dead]
+            refs = sum(db.execute(f"SELECT COUNT(*) FROM {t} WHERE open_na_id=?",
+                                  (slug,)).fetchone()[0]
+                       for t in ("meeting_speakers", "bill_proposers", "bill_votes",
+                                 "member_committees"))
+            if len(live) == 1:
+                for t in ("meeting_speakers", "bill_proposers", "bill_votes",
+                          "member_committees"):
+                    # OR IGNORE — 살아 있는 쪽이 이미 그 행을 갖고 있으면 죽은 쪽이 중복이다
+                    db.execute(f"UPDATE OR IGNORE {t} SET open_na_id=? WHERE open_na_id=?",
+                               (live[0], slug))
+                    db.execute(f"DELETE FROM {t} WHERE open_na_id=?", (slug,))
+                merged.append((slug, live[0]))
+            elif refs or live:
+                continue          # 참조가 남아 있거나 후보가 여럿 — 사람이 봐야 한다
+            else:
+                dropped.append(slug)
+            db.execute("DELETE FROM members WHERE open_na_id=?", (slug,))
+            db.execute("DELETE FROM collect_failures WHERE target_kind='member' AND target_key=?",
+                       (slug,))
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    return merged, dropped
+
+
 def schema_drift(db: sqlite3.Connection) -> list[str]:
     """이 DB에 실제로 박힌 스키마가 현재 SCHEMA와 다른 테이블 이름들.
 
@@ -1038,6 +1144,23 @@ def selftest(db_path: str) -> int:
     except sqlite3.OperationalError as e:
         check("init_schema 재실행이 안전하다 (IF NOT EXISTS)", False, str(e))
 
+    # ── 죽은 slug 합치기: 합치는 쪽과 **동명이인을 지키는** 쪽을 둘 다 본다
+    upsert_member(db, "JEONGHYEKYEONG", name="정혜경", party="진보당")
+    upsert_member(db, "JUNGHYEKYUNG", name="정혜경")        # record 가 준 404 slug
+    record_failure(db, "member", "JUNGHYEKYUNG", kind="gone", detail="http:404")
+    db.execute("INSERT INTO member_committees VALUES ('JUNGHYEKYUNG','과학기술정보방송통신위원회')")
+    upsert_member(db, "PARKJIEWON", name="박지원", party="더불어민주당")
+    upsert_member(db, "PARKJIWON", name="박지원", party="더불어민주당")   # 진짜 동명이인
+    merged, _ = merge_dead_member_slugs(db)
+    check("죽은 slug 를 살아 있는 동명으로 합친다",
+          merged == [("JUNGHYEKYUNG", "JEONGHYEKYEONG")], str(merged))
+    check("합칠 때 자식 행을 살아 있는 쪽으로 옮긴다",
+          db.execute("SELECT COUNT(*) FROM member_committees WHERE open_na_id='JEONGHYEKYEONG'"
+                     ).fetchone()[0] == 1)
+    # ⚠️ 이름만으로 합쳤으면 여기서 두 사람이 한 사람이 된다. 실제로 22대에 박지원이 둘이다.
+    check("둘 다 살아 있는 동명이인은 건드리지 않는다",
+          db.execute("SELECT COUNT(*) FROM members WHERE name='박지원'").fetchone()[0] == 2)
+
     # ── 드리프트 감지가 실제로 작동한다
     check("정상 DB에는 드리프트가 없다", schema_drift(db) == [], str(schema_drift(db)))
     db.execute("ALTER TABLE bill_meetings RENAME TO bill_meetings_x")
@@ -1077,7 +1200,7 @@ def selftest(db_path: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["init", "schema", "selftest"])
+    ap.add_argument("command", choices=["init", "schema", "selftest", "consolidate"])
     ap.add_argument("--db", default=str(DB_PATH),
                     help="기본값은 실제 CONGRESS.db다. selftest 는 대상을 지우므로 받지 않는다")
     a = ap.parse_args()
@@ -1101,6 +1224,17 @@ def main() -> int:
     if a.command == "schema":
         for r in db.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"):
             print(r[0], ";\n", sep="")
+        return 0
+    if a.command == "consolidate":
+        # 같은 실체가 두 행이 된 것을 합친다. **자동이 아니다** — 데이터를 다시 쓰는
+        # 연산이라 감사(committee_near_dupes · gone_total)를 보고 사람이 부른다.
+        for drop, keep in (m := consolidate_committees(db)):
+            print(f"  {drop!r}\n    → {keep!r}")
+        print(f"합친 위원회 {len(m)}쌍")
+        merged, dropped = merge_dead_member_slugs(db)
+        for drop, keep in merged:
+            print(f"  {drop} → {keep}")
+        print(f"합친 의원 {len(merged)}명 · 참조 없는 잔재 {len(dropped)}행 삭제")
         return 0
 
     print(f"initialized {a.db}")
