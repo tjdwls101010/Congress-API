@@ -535,18 +535,31 @@ def schema_drift(db: sqlite3.Connection) -> list[str]:
 
 def upsert_committee(db: sqlite3.Connection, name: str, *,
                      committee_class: str | None = None,
-                     parent: str | None = None) -> None:
-    """모르는 위원회명을 만나면 거부하지 말고 먼저 등록한다.
+                     parent: str | None = None) -> str:
+    """모르는 위원회명을 만나면 거부하지 말고 먼저 등록한다. **실제로 저장된 표기를 돌려준다.**
 
     FK의 목적은 표기가 갈라지지 않게 하는 것이지 새 값을 막는 것이 아니다.
     수집 중 이 함수를 부르지 않고 바로 INSERT하면 FK 위반으로 **그 데이터를 잃는다.**
 
+    ⚠️ **돌려준 이름을 써서 INSERT하라.** 넘긴 이름과 다를 수 있다(아래 표기 통일).
+       넘긴 이름 그대로 자식 행을 넣으면 FK 위반으로 그 행이 통째로 실패한다.
     ⚠️ ``parent``가 있으면 상위 위원회를 먼저 등록한다 — 자기참조 FK라 순서가 강제된다.
     ⚠️ ``first_seen_at``은 절대 덮어쓰지 않는다. committees에는 updated_at이 없어서
        이 컬럼이 유일한 시각이고, 덮어쓰면 "언제 처음 봤나"가 매 실행 오늘로 밀린다.
     """
     if parent:
-        upsert_committee(db, parent)
+        parent = upsert_committee(db, parent)
+    # ⚠️ **두 원천이 같은 위원회를 다르게 적는다** — likms 는 '기후위기 특별위원회',
+    #    record 는 '기후위기특별위원회'. 그대로 두면 committees 에 두 행이 되고,
+    #    "이 위원회를 거친 것 전부"가 조용히 절반만 온다. 에러는 나지 않는다.
+    #    공백·중점만 다른 기존 행이 있으면 **그 표기를 쓴다** — 먼저 본 표기가 이긴다.
+    #    어느 쪽이 옳다고 판정할 근거가 원천에 없어서 한쪽으로 모으기만 한다.
+    #    감사의 committee_near_dupes 가 이 규칙이 새는지 계속 지켜본다.
+    if row := db.execute(
+            "SELECT committee_name FROM committees WHERE "
+            "replace(replace(replace(committee_name,' ',''),'·',''),'ㆍ','') = "
+            "replace(replace(replace(?,' ',''),'·',''),'ㆍ','')", (name,)).fetchone():
+        name = row[0]
     db.execute(
         """INSERT INTO committees (committee_name, committee_class, parent_committee, first_seen_at)
            VALUES (?, ?, ?, ?)
@@ -554,6 +567,7 @@ def upsert_committee(db: sqlite3.Connection, name: str, *,
                committee_class  = COALESCE(excluded.committee_class, committee_class),
                parent_committee = COALESCE(excluded.parent_committee, parent_committee)""",
         (name, committee_class, parent, now_str()))
+    return name
 
 
 def upsert_member(db: sqlite3.Connection, open_na_id: str, *,
@@ -787,6 +801,20 @@ def selftest(db_path: str) -> int:
     check("UPSERT가 committee_class는 보강한다",
           db.execute("SELECT committee_class FROM committees WHERE committee_name = ?",
                      ("과학기술정보방송통신위원회",)).fetchone()[0] == "상임위원회")
+    # 두 원천의 표기 차이를 한쪽으로 모은다 — likms '기후위기 특별위원회' / record '기후위기특별위원회'
+    before = db.execute("SELECT COUNT(*) FROM committees").fetchone()[0]
+    got = upsert_committee(db, "과학기술정보 방송통신위원회")          # 공백만 다르다
+    check("공백만 다른 위원회가 새 행을 만들지 않는다",
+          db.execute("SELECT COUNT(*) FROM committees").fetchone()[0] == before)
+    check("기존 표기를 돌려준다 — 이 값으로 자식 행을 넣어야 FK가 산다",
+          got == "과학기술정보방송통신위원회", got)
+    check("중점(·)만 다른 것도 같은 위원회로 본다",
+          upsert_committee(db, "과학기술정보·방송통신위원회") == "과학기술정보방송통신위원회")
+    # ⚠️ 상위로 수식한 소위 이름은 **별개 위원회다.** 여기서 접히면 법사위 제1소위와
+    #    복지위 제1소위가 한 행이 되어 조회가 조용히 남의 회의를 섞어 준다.
+    a = upsert_committee(db, "법제사법위원회 법안심사제1소위원회", parent="법제사법위원회")
+    b = upsert_committee(db, "보건복지위원회 법안심사제1소위원회", parent="보건복지위원회")
+    check("상위가 다른 같은 이름 소위는 서로 다른 행이다", a != b, f"{a} / {b}")
 
     # ── 의원: 스텁 생성과 COALESCE 보강
     upsert_member(db, "LEEHAIMIN", name="이해민", party="조국혁신당")

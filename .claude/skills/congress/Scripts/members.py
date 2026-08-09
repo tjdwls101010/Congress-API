@@ -134,7 +134,7 @@ def enrich(db, session: net.Session, slug: str, **hints) -> bool:
     committees = p.pop("committees", [])
     dbm.upsert_member(db, slug, **p)
     for c in committees:
-        dbm.upsert_committee(db, c)               # 참조되는 쪽 먼저
+        c = dbm.upsert_committee(db, c)           # 참조되는 쪽 먼저. 돌려받은 표기를 쓴다
         db.execute("INSERT OR IGNORE INTO member_committees VALUES (?, ?)", (slug, c))
     dbm.clear_failure(db, "member", slug)
     return True
