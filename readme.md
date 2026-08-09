@@ -4,7 +4,7 @@
 
 ## 현재 상태
 
-**설계 완료 · 구현 착수 전.** 구현 계획은 [`docs/plan/260808`](docs/plan/260808/)에 있고, 원천 엔드포인트·응답 구조·함정이 전부 실측으로 확인돼 있다.
+**동작 중.** 스킬은 [`.claude/skills/congress`](.claude/skills/congress/)에 있고, 하루 1회 self-hosted 러너에서 수집이 돈다. 구현 계획과 원천 정찰 기록은 [`docs/plan/260808`](docs/plan/260808/)에 있다.
 
 ## 왜 만드는가
 
@@ -39,8 +39,23 @@
 
 ## 시작하기
 
-구현을 시작한 뒤에 작성한다.
+`uv`만 있으면 된다. 의존성은 스크립트마다 PEP 723으로 선언돼 있어 `uv run`이 알아서 받는다.
+
+```bash
+uv run .claude/skills/congress/Scripts/collect.py           # 수집 — 따라잡기
+uv run .claude/skills/congress/Scripts/collect.py --audit-only   # 상태만 (락을 안 잡는다)
+sqlite3 .claude/skills/congress/CONGRESS.db .schema        # 여기서부터 읽어라
+```
+
+DB는 저장소에 없다(재구축 가능한 거대 바이너리다). 처음 받으면 의안 상세 2만 건이 가장 길다 — 동시 6으로 약 1.5시간이고, 중간에 죽어도 다음 실행이 이어받는다.
+
+문제가 생겼을 때 어느 쪽이 깨졌는지 가르는 도구가 둘이다.
+
+```bash
+uv run .claude/skills/congress/Scripts/db.py selftest --db /tmp/t.db   # 우리 코드가 회귀했나
+uv run .claude/skills/congress/Scripts/verify.py                       # 국회 사이트가 바뀌었나
+```
 
 ## 라이선스
 
-미정.
+미정. 수집물은 국회 웹사이트의 공개 자료이고 이 저장소에 포함되지 않는다.

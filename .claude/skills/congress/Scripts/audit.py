@@ -28,6 +28,16 @@ SEED = Path(__file__).resolve().parent.parent / "members_seed.json"
 NUM7 = "[0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
 
 #: 게이트 — 하나라도 fail 이면 실행이 실패다.
+#:
+#: ⚠️ **게이트는 "우리 수집이 틀렸다"만 담는다.** 원천이 보장하지 않는 것을 여기 두면
+#:    고칠 수 없는 빨간불이 되고, 그러면 사람이 표 전체를 무시하게 된다.
+#:    실측으로 둘을 여기서 내려보냈다:
+#:      promulgated_without_number  원천이 공포번호 칸을 비워 둔 의안이 실제로 있다
+#:                                  (2214602·2215132·2218525 — 공포일자만 있고 번호가 빈 <span>)
+#:      sitting_gaps                차수 매김 규칙이 종류마다 달라 오탐이 나고, 남는 것도
+#:                                  "원천이 공개하지 않는 회의"와 구분되지 않는다.
+#:                                  회의 완결성의 증명은 meeting_bodies_missing 쪽이다 —
+#:                                  열거한 id 를 전부 받았는가.
 GATES: dict[str, tuple[str, str]] = {
     "bill_no_gaps": ("의안번호에 구멍이 없다", f"""
         WITH n AS (SELECT CAST(bill_no AS INTEGER) no FROM bills
@@ -45,13 +55,6 @@ GATES: dict[str, tuple[str, str]] = {
           AND NOT EXISTS (SELECT 1 FROM collect_failures f
                           WHERE f.target_kind='meeting_body'
                             AND f.target_key=CAST(m.conference_id AS TEXT))"""),
-    "sitting_gaps": ("차수가 연속이다 (국정감사 제외 — 알려진 사각지대)", """
-        SELECT COUNT(*) FROM meetings m
-        WHERE m.sitting_no > 1 AND m.session_no IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM meetings p
-                          WHERE p.committee_name=m.committee_name
-                            AND p.session_no=m.session_no
-                            AND p.sitting_no=m.sitting_no-1)"""),
     "dangling_alt_bills": ("alt_bill_id 가 가리키는 의안이 전부 있다", """
         SELECT COUNT(*) FROM bills b WHERE b.alt_bill_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM bills t WHERE t.bill_id=b.alt_bill_id)"""),
@@ -62,13 +65,33 @@ GATES: dict[str, tuple[str, str]] = {
     "unresolved_retriable": ("상한 미달의 재시도 대상이 없다", f"""
         SELECT COUNT(*) FROM collect_failures
         WHERE kind='retriable' AND attempts < {dbm.MAX_ATTEMPTS}"""),
-    "promulgated_without_number": ("공포 단계가 있는데 공포번호가 빈 의안이 없다", """
-        SELECT COUNT(*) FROM bill_stages s
-        WHERE s.stage='공포' AND (s.ref_no IS NULL OR s.ref_no='')"""),
 }
 
 #: 보고값 — 등식이 아니다. 값과 추이를 본다.
 REPORTS: dict[str, tuple[str, str]] = {
+    "sitting_gaps": ("차수가 끊긴 자리. **우리 누락과 원천 미공개가 섞여 있다** — 게이트가 아니다", """
+        -- 차수 매김이 종류마다 다르다. 한 질의로 재면 오탐이 쏟아진다:
+        --   상임위·예결위  회기마다 1로 돌아간다        → 같은 회기 안에서 본다
+        --   특위·국정조사  임기 전체에 걸쳐 이어진다    → 회기를 넘어 본다
+        --                  (실측: 420회 1~4차 → 421회 5차 → 422회 6~11차)
+        --   국정감사       회기·차수 개념이 없다        → 대상 아님
+        -- 처음엔 전부 '같은 회기 안'으로 재서 70이 나왔는데 42가 회기 경계 오탐이었다.
+        SELECT (SELECT COUNT(*) FROM meetings m
+                WHERE m.sitting_no > 1 AND m.session_no IS NOT NULL
+                  AND m.committee_class IN ('상임위원회','예산결산특별위원회')
+                  AND NOT EXISTS (SELECT 1 FROM meetings p
+                                  WHERE p.committee_name=m.committee_name
+                                    AND p.session_no=m.session_no
+                                    AND p.sitting_no=m.sitting_no-1))
+             + (SELECT COUNT(*) FROM meetings m
+                WHERE m.sitting_no > 1
+                  AND m.committee_class IN ('특별위원회','국정조사')
+                  AND NOT EXISTS (SELECT 1 FROM meetings p
+                                  WHERE p.committee_name=m.committee_name
+                                    AND p.sitting_no=m.sitting_no-1))"""),
+    "promulgated_without_number": ("공포 단계인데 공포번호가 빈 의안. **원천이 비워 둔다** — 추이를 본다", """
+        SELECT COUNT(*) FROM bill_stages s
+        WHERE s.stage='공포' AND (s.ref_no IS NULL OR s.ref_no='')"""),
     "bill_no_min": ("의안번호 하한 (기대 2200001)",
                     f"SELECT MIN(CAST(bill_no AS INTEGER)) FROM bills "
                     f"WHERE assembly_unit=22 AND bill_no GLOB '{NUM7}'"),
