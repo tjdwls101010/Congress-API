@@ -83,6 +83,14 @@ def 의안(s: net.Session, ok) -> None:
     ok("의안-회의 링크에서 회의록 id 가 나온다", any(m["conference_id"] == 52677 for m in mts),
        [m["conference_id"] for m in mts])
 
+    # 제안이유 팝업의 본문은 <pre> 안에 있다. body 를 통째로 담으면 제목·창닫기 버튼·
+    # 의안명·제안자에 더해 <script> 소스까지 딸려 온다 — 실측에서 전량이 그랬다.
+    pre = HTMLParser(s.get(f"{bills.SUMMARY}?billId={AI법}").text).css_first("pre")
+    ok("제안이유가 <pre> 안에 온다", pre is not None and len(pre.text(strip=True)) > 1000,
+       len(pre.text(strip=True)) if pre else None)
+    ok("제안이유에 페이지 부속물이 안 섞인다",
+       pre is not None and not re.search(r"창닫기|innerHTML|function\s*\(", pre.text()))
+
     d2 = bills.parse_detail(s.get(f"{bills.DETAIL}?billId={소프트웨어}").text)
     vs, vlist, missing = bills.parse_votes(
         s.xhr(bills.VOTE, {"billId": 소프트웨어, "_csrf": s.likms_csrf()},

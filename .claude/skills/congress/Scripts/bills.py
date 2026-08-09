@@ -188,6 +188,11 @@ def cell_values(tr) -> dict[str, str]:
         spans = [n for n in td.iter() if n.tag == "span"]
         text = (" ".join(n.text(separator=" ", strip=True) for n in spans) if spans
                 else td.text(separator=" ", strip=True))
+        # ⚠️ 원천이 줄바꿈을 **이중 이스케이프**해서 보내는 칸이 있다 — `&lt;br&gt;` 가
+        #    텍스트 노드에 그대로 남아 값이 '수정안반영폐기<br>예산부수법률안 …' 이 된다.
+        #    `<br>` 뒤는 부연이고 앞이 값이다. 잘라 두지 않으면 result 가 열거형이기를
+        #    멈춰서 `result='수정안반영폐기'` 조회가 그 39건을 놓친다.
+        text = re.split(r"<br\s*/?>", text, maxsplit=1, flags=re.I)[0]
         out[cls[0]] = re.sub(r"\s+", " ", text).strip() or None
     return out
 
@@ -370,12 +375,19 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
     extra["is_reexamination"] = 1 if f.get("reexamYn") == "Y" else 0
     extra["withdraw_count"] = int(f.get("withdrawCnt") or 0)
     extra["alt_bill_id"] = f.get("selRefBillId") or None
-    extra["head_memo"] = f.get("headMemoInfo") or None
+    extra["head_memo"] = (f.get("headMemoInfo") or "").strip() or None
     try:
         s = session.get(f"{SUMMARY}?billId={bill_id}")
         if s.status_code == 200:
-            txt = HTMLParser(s.text).body
-            extra["reason_text"] = txt.text(separator="\n", strip=True) if txt else None
+            # ⚠️ **body 를 통째로 담지 마라.** 이 팝업은 제목·`창닫기` 버튼·의안명·제안자에
+            #    더해 **<script> 소스까지** 갖고 있고, body.text() 는 그걸 다 긁어 온다.
+            #    실측에서 20,598건 전량이 그렇게 오염됐고, 이 컬럼이 키워드 검색의 주
+            #    대상이라 검색이 자바스크립트를 물었다.
+            # ⚠️ 본문이 없는 의안은 <pre> 가 아예 없고 '해당 의안 정보를 찾을 수 없습니다'
+            #    안내문만 온다(실측 654건). 그때는 **NULL 이어야 한다** — 안내문을 담으면
+            #    reason_text IS NOT NULL 이 참이 되고 검색이 그 문장을 물어 온다.
+            pre = HTMLParser(s.text).css_first("pre")
+            extra["reason_text"] = pre.text(strip=True) if pre else None
     except Exception:
         pass   # 제안이유는 없을 수 있다. 판정자로 쓰지 않으므로 실패해도 진행한다
 
