@@ -801,8 +801,15 @@ def upsert_bill_list(db: sqlite3.Connection, row: dict) -> None:
        명시하지 않은 컬럼이 전부 기본값으로 돌아간다 — 애써 받은 reason_text 와
        detail_collected_at 이 조용히 사라지고, 중복 행이 안 생기니 겉보기엔 멀쩡하며,
        증상은 "매 실행마다 전량을 다시 받는다"로만 나타나 성능 문제로 오진하기 쉽다.
+
+    ⚠️ **빈 문자열은 NULL 로 바꿔 넣는다.** 목록 표의 빈 칸은 ``''`` 로 파싱되는데,
+       그대로 두면 ``decision_result IS NULL`` 이 **0건**을 돌려준다 — SKILL.md 가
+       "미처리"를 판별하라고 가르치는 바로 그 질의다. 실측에서 전체 20,598건 중
+       **14,712건(71%)** 이 ``''`` 였고, 그 질의는 에러 없이 빈 답을 냈다.
+       "값이 없다"를 표현하는 방법은 이 DB 안에서 하나여야 한다.
     """
-    cols = {k: row.get(k) for k in BILL_LIST_COLS if k in row}
+    cols = {k: (v if v not in ("", None) else None)
+            for k in BILL_LIST_COLS if k in row for v in (row.get(k),)}
     now = now_str()
     names = ["bill_no", *cols, "collected_at", "updated_at"]
     vals = [row["bill_no"], *cols.values(), now, now]
