@@ -38,6 +38,8 @@ NUM7 = "[0-9][0-9][0-9][0-9][0-9][0-9][0-9]"
 #:                                  "원천이 공개하지 않는 회의"와 구분되지 않는다.
 #:                                  회의 완결성의 증명은 meeting_bodies_missing 쪽이다 —
 #:                                  열거한 id 를 전부 받았는가.
+#:      dangling_alt_bills          selRefBillId 가 번호 없는 위원회 대안 초안(billNo='DD20811')을
+#:                                  가리킨다. 그 문서는 원천의 의안검색에도 없다.
 GATES: dict[str, tuple[str, str]] = {
     "bill_no_gaps": ("의안번호에 구멍이 없다", f"""
         WITH n AS (SELECT CAST(bill_no AS INTEGER) no FROM bills
@@ -55,13 +57,16 @@ GATES: dict[str, tuple[str, str]] = {
           AND NOT EXISTS (SELECT 1 FROM collect_failures f
                           WHERE f.target_kind='meeting_body'
                             AND f.target_key=CAST(m.conference_id AS TEXT))"""),
-    "dangling_alt_bills": ("alt_bill_id 가 가리키는 의안이 전부 있다", """
-        SELECT COUNT(*) FROM bills b WHERE b.alt_bill_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM bills t WHERE t.bill_id=b.alt_bill_id)"""),
-    "orphan_bill_meetings": ("본회의를 뺀 bill_meetings 의 회의가 meetings 에 있다", """
+    "orphan_bill_meetings": ("본회의를 뺀 bill_meetings 의 회의가 meetings 에 있다 (실패 원장 제외)", """
         SELECT COUNT(*) FROM bill_meetings bm
         WHERE bm.stage <> '본회의'
-          AND NOT EXISTS (SELECT 1 FROM meetings m WHERE m.conference_id=bm.conference_id)"""),
+          AND NOT EXISTS (SELECT 1 FROM meetings m WHERE m.conference_id=bm.conference_id)
+          -- 원장에 있는 회의는 아직 못 받은 것이지 트리가 빠뜨린 것이 아니다.
+          -- meeting_bodies_missing 과 같은 규칙을 쓴다 — 안 그러면 재시도 대상 한 건이
+          -- 그 회의를 참조하는 의안 수만큼 이 게이트를 빨갛게 만든다(실측: 1건 → 20).
+          AND NOT EXISTS (SELECT 1 FROM collect_failures f
+                          WHERE f.target_kind='meeting_body'
+                            AND f.target_key=CAST(bm.conference_id AS TEXT))"""),
     "unresolved_retriable": ("상한 미달의 재시도 대상이 없다", f"""
         SELECT COUNT(*) FROM collect_failures
         WHERE kind='retriable' AND attempts < {dbm.MAX_ATTEMPTS}"""),
@@ -92,6 +97,14 @@ REPORTS: dict[str, tuple[str, str]] = {
     "promulgated_without_number": ("공포 단계인데 공포번호가 빈 의안. **원천이 비워 둔다** — 추이를 본다", """
         SELECT COUNT(*) FROM bill_stages s
         WHERE s.stage='공포' AND (s.ref_no IS NULL OR s.ref_no='')"""),
+    "dangling_alt_bills": ("alt_bill_id 가 가리키는 의안이 목록에 없는 건수. **원천이 의안 아닌 문서를 가리킨다**", """
+        -- 실측 4,397개 링크 중 241개(5.5%)가 안 풀린다. 그 대상들의 billNo 는
+        -- 'DD20811' 처럼 의안번호가 아니다 — 번호가 붙기 전의 위원회 대안 초안이라
+        -- 원천의 의안검색(20,598건)에도 안 나온다. 우리 목록이 빠뜨린 것이 아니다:
+        -- bill_no_gaps=0 이 번호 있는 의안의 완결성을 이미 증명한다.
+        -- 값이 크게 튀면 그때가 신호다.
+        SELECT COUNT(*) FROM bills b WHERE b.alt_bill_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM bills t WHERE t.bill_id=b.alt_bill_id)"""),
     "bill_no_min": ("의안번호 하한 (기대 2200001)",
                     f"SELECT MIN(CAST(bill_no AS INTEGER)) FROM bills "
                     f"WHERE assembly_unit=22 AND bill_no GLOB '{NUM7}'"),
