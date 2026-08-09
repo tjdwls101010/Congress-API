@@ -105,18 +105,26 @@ def main() -> int:
                 if "bills" in only:
                     print("의안 목록:")
                     bills.collect_list(db, s)
+                    # 아직 못 받은 것 **또는** 원장에 살아 있는 실패가 붙은 것.
+                    # 뒤엣것이 없으면 한 번 받은 뒤 실패한 재수집이 영영 재시도되지 않고
+                    # unresolved_retriable 게이트가 영구히 빨갛다 (db.retry_queue 주석 참조).
                     todo = [(r[0], r[1]) for r in db.execute(
-                        "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
-                        "AND bill_kind IN ('법률안','미상')")][:a.limit or None]
+                        "SELECT bill_no, bill_id FROM bills WHERE bill_kind IN ('법률안','미상') "
+                        "AND (detail_collected_at IS NULL OR EXISTS ("
+                        "  SELECT 1 FROM collect_failures f WHERE f.target_kind='bill_detail' "
+                        "  AND f.target_key = bills.bill_no AND f.kind='retriable' "
+                        "  AND f.attempts < ?))", (dbm.MAX_ATTEMPTS,))][:a.limit or None]
                     print(f"의안 상세 {len(todo):,}건 (동시 {a.workers})")
                     # 수집 전체에서 여기만 동시로 돈다 — 근거는 bills.collect_details 주석.
                     bills.collect_details(a.db, todo, rate=a.rate, workers=a.workers)
                 if "meetings" in only:
                     print("회의록 열거:")
                     ids = meetings.enumerate_ids(s)
-                    todo = [c for c in ids if not db.execute(
-                        "SELECT 1 FROM meeting_utterances WHERE conference_id=? LIMIT 1",
-                        (c,)).fetchone()][:a.limit or None]
+                    retry = dbm.retry_queue(db, "meeting_body")
+                    todo = [c for c in ids
+                            if str(c) in retry or not db.execute(
+                                "SELECT 1 FROM meeting_utterances WHERE conference_id=? LIMIT 1",
+                                (c,)).fetchone()][:a.limit or None]
                     print(f"회의록 본문 {len(todo):,}건")
                     for cid in todo:
                         meetings.collect_one(db, s, cid, meetings.CLASSES[ids[cid]])
