@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -34,17 +35,24 @@ import meetings           # noqa: E402
 import members            # noqa: E402
 import net                # noqa: E402
 
-LOCK = dbm.DB_PATH.with_suffix(".db.lock")
+def lock_path(db_path: str) -> Path:
+    """락은 **``--db`` 가 가리키는 그 파일 옆**에 둔다.
+
+    ⚠️ 기본 경로로 고정하면 안 된다. 예약 실행은 러너 작업공간의 체크아웃에서 돌면서
+       ``--db`` 로 실제 DB 를 겨누는데(워크플로 참고), 락을 작업공간 쪽에 만들면
+       손으로 돌린 수집과 예약 수집이 **서로를 막지 못한 채 같은 DB 를 동시에 쓴다.**
+    """
+    return Path(db_path).with_suffix(".db.lock")
 
 
-def acquire_lock() -> bool:
+def acquire_lock(lock: Path) -> bool:
     """동시 실행은 하나만. 이미 돌고 있으면 **종료코드 0으로 빠진다 — 실패가 아니다.**
 
     매 실행은 슬롯이 아니라 따라잡기여서 다음 실행이 이번 몫까지 가져간다.
     이걸 실패로 처리하면 cron 이 매번 빨간불을 내고 곧 무시된다.
     """
     try:
-        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         os.write(fd, f"{os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode())
         os.close(fd)
         return True
@@ -77,43 +85,50 @@ def main() -> int:
                          ensure_ascii=False, indent=2))
         return 0
 
-    if not acquire_lock():
-        print(f"이미 실행 중이다 ({LOCK}). 이번 실행은 건너뛴다 — 실패가 아니다.")
+    lock = lock_path(a.db)
+    if not acquire_lock(lock):
+        print(json.dumps({"ok": True, "skipped": f"이미 실행 중이다 ({lock})",
+                          "invariants": {}}, ensure_ascii=False, indent=2))
         return 0
+    # 진행 로그는 **stderr 로 보낸다.** stdout 은 판정 JSON 한 장을 위한 자리다 —
+    # 섞어 두면 자동화가 그 JSON 을 파싱하지 못해 요약 표가 통째로 비고, 그러면
+    # "로그를 직접 보라"는 상태로 돌아간다. 도메인 모듈들의 print 까지 한 번에 옮긴다.
     try:
-        if a.retry == "all":
-            print(f"되살린 실패 {dbm.reset_retriable(db)}건")
-        only = set(a.only or ["members", "bills", "meetings"])
-        with net.Session(rate=a.rate) as s:
-            if "members" in only:
-                n = members.load_seed(db)
-                print(f"의원 시드: {n}명" if n else "의원 시드 없음 (정상)")
-            if "bills" in only:
-                print("의안 목록:")
-                bills.collect_list(db, s)
-                todo = [(r[0], r[1]) for r in db.execute(
-                    "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
-                    "AND bill_kind IN ('법률안','미상')")][:a.limit or None]
-                print(f"의안 상세 {len(todo):,}건 (동시 {a.workers})")
-                # 수집 전체에서 여기만 동시로 돈다 — 근거는 bills.collect_details 주석.
-                bills.collect_details(a.db, todo, rate=a.rate, workers=a.workers)
-            if "meetings" in only:
-                print("회의록 열거:")
-                ids = meetings.enumerate_ids(s)
-                todo = [c for c in ids if not db.execute(
-                    "SELECT 1 FROM meeting_utterances WHERE conference_id=? LIMIT 1",
-                    (c,)).fetchone()][:a.limit or None]
-                print(f"회의록 본문 {len(todo):,}건")
-                for cid in todo:
-                    meetings.collect_one(db, s, cid, meetings.CLASSES[ids[cid]])
-            if "members" in only:
-                # 마지막에 돌린다 — 앞 단계가 만든 스텁을 상세 페이지로 채우기 위해서다.
-                todo = [r[0] for r in db.execute("SELECT open_na_id FROM members")][:a.limit or None]
-                print(f"의원 보강 {len(todo):,}명")
-                for slug in todo:
-                    members.enrich(db, s, slug)
+        with contextlib.redirect_stdout(sys.stderr):
+            if a.retry == "all":
+                print(f"되살린 실패 {dbm.reset_retriable(db)}건")
+            only = set(a.only or ["members", "bills", "meetings"])
+            with net.Session(rate=a.rate) as s:
+                if "members" in only:
+                    n = members.load_seed(db)
+                    print(f"의원 시드: {n}명" if n else "의원 시드 없음 (정상)")
+                if "bills" in only:
+                    print("의안 목록:")
+                    bills.collect_list(db, s)
+                    todo = [(r[0], r[1]) for r in db.execute(
+                        "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
+                        "AND bill_kind IN ('법률안','미상')")][:a.limit or None]
+                    print(f"의안 상세 {len(todo):,}건 (동시 {a.workers})")
+                    # 수집 전체에서 여기만 동시로 돈다 — 근거는 bills.collect_details 주석.
+                    bills.collect_details(a.db, todo, rate=a.rate, workers=a.workers)
+                if "meetings" in only:
+                    print("회의록 열거:")
+                    ids = meetings.enumerate_ids(s)
+                    todo = [c for c in ids if not db.execute(
+                        "SELECT 1 FROM meeting_utterances WHERE conference_id=? LIMIT 1",
+                        (c,)).fetchone()][:a.limit or None]
+                    print(f"회의록 본문 {len(todo):,}건")
+                    for cid in todo:
+                        meetings.collect_one(db, s, cid, meetings.CLASSES[ids[cid]])
+                if "members" in only:
+                    # 마지막에 돌린다 — 앞 단계가 만든 스텁을 상세로 채우기 위해서다.
+                    todo = [r[0] for r in db.execute(
+                        "SELECT open_na_id FROM members")][:a.limit or None]
+                    print(f"의원 보강 {len(todo):,}명")
+                    for slug in todo:
+                        members.enrich(db, s, slug)
     finally:
-        LOCK.unlink(missing_ok=True)
+        lock.unlink(missing_ok=True)
 
     res = audit.run(db, audit.SEED.exists())
     failed = [k for k, v in res.items() if v["status"] == "fail"]

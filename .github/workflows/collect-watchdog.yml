@@ -1,38 +1,72 @@
-# 워치독 — 감시 대상이 맥이므로 감시자는 맥 밖에 있어야 한다.
+# 수집이 **조용히** 멈추면 빨간불로 알린다.
 #
-# 러너가 죽거나 맥이 하루 넘게 꺼져 있으면 예약 run 이 24시간 큐 대기 후 cancelled 로
-# 사라진다. **취소는 실패가 아니라서 알림이 가지 않는다** — 그래서 "아무 메일도 안 왔으니
-# 잘 돌고 있나 보다"가 몇 주씩 이어질 수 있다. 이 워크플로가 그 침묵을 깬다.
+# 배경: scheduled-collect 는 self-hosted 러너에서 돈다. 러너가 죽거나 맥이 하루 넘게
+#   꺼져 있으면 예약 run 은 24시간 큐 대기 후 *cancelled* 로 사라지는데, **취소는 실패가
+#   아니라서 알림이 가지 않는다.** 그러면 "아무 메일도 안 왔으니 잘 돌고 있나 보다"가
+#   몇 주씩 이어질 수 있다.
+#
+# 왜 데이터가 아니라 run 이력을 보나: 여기 DB 는 로컬 SQLite 라 **클라우드에서 볼 수 있는
+#   흔적이 없다.** 그래서 워크플로 자신의 성공 이력을 본다. 이 워치독이 놓치는 것은
+#   "수집이 돌긴 하는데 결과가 이상한" 경우인데, 그건 scheduled-collect 가 스스로
+#   빨간불(게이트 위반)로 알리므로 둘이 서로의 사각을 덮는다.
+#
+# 왜 ubuntu-latest 인가: 감시 대상이 내 맥이므로 감시자는 맥 밖에 있어야 한다.
+#   self-hosted 로 두면 러너가 죽는 순간 워치독도 같이 죽어 아무 소용이 없다.
 name: collect-watchdog
 
 on:
   schedule:
-    - cron: "0 3 * * *"    # 12:00 KST — 수집이 끝났어야 할 시각 이후
+    - cron: "0 3 * * *"    # 12:00 KST — 04:00 수집이 끝났어야 할 시각 이후
   workflow_dispatch:
     inputs:
       max_age_hours:
-        description: "성공한 수집이 이보다 오래됐으면 실패로 본다 (-1 을 주면 빨간불 경로를 시험한다)"
-        default: "30"
+        description: "성공한 수집이 이보다 오래됐으면 실패로 본다. 빨간불 경로를 시험하려면 -1 을 준다."
+        required: false
+        type: string
+
+permissions:
+  actions: read
 
 jobs:
   watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # 하루 한 번 도는데 30시간이 비었다면 러너 사망·맥 장기 부재·스케줄 자동 비활성 중
+      # 하나다. 24시간으로 잡으면 크론 지연만으로 울어 곧 무시하게 되고, 며칠로 잡으면
+      # 주말을 통째로 놓친다.
+      #
+      # 디스패치 입력으로 덮어쓸 수 있게 둔 이유: **빨간불이 나오는 것을 본 적 없는
+      # 워치독은 워치독이 아니다.** -1 을 주면 실패 경로가 그대로 돈다.
+      MAX_AGE: ${{ inputs.max_age_hours || '30' }}
+      WORKFLOW: scheduled-collect.yml
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
       - name: 마지막 성공 수집이 언제인가
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MAX_AGE: ${{ github.event.inputs.max_age_hours || '30' }}
         run: |
           set -euo pipefail
-          last=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow scheduled-collect.yml \
-                   --status success --limit 1 --json updatedAt --jq '.[0].updatedAt // empty')
-          if [ -z "$last" ]; then
-            echo "::error::scheduled-collect 의 성공 기록이 하나도 없다. 러너가 이 저장소에 등록돼 있나?"
+
+          # `|| true` 가 필요하다 — 워크플로가 아직 default 브랜치에 없으면 404 라서,
+          # 그대로 두면 set -e 가 아래 안내 메시지 대신 알 수 없는 에러로 죽는다.
+          latest="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW}/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].updated_at // empty' 2>/dev/null || true)"
+
+          if [ -z "$latest" ]; then
+            echo "::error::${WORKFLOW} 의 성공 run 이 하나도 없다 — 러너 등록이나 스케줄 활성 상태를 확인하라."
+            echo "::error:: 러너 확인: repo Settings → Actions → Runners"
+            echo "::error:: 맥에서: ~/actions-runner-congress-api/svc.sh status"
             exit 1
           fi
-          age=$(( ( $(date -u +%s) - $(date -u -d "$last" +%s) ) / 3600 ))
-          echo "마지막 성공: $last (${age}시간 전) · 임계 ${MAX_AGE}시간"
+
+          age=$(( ( $(date -u +%s) - $(date -u -d "$latest" +%s) ) / 3600 ))
+          echo "최근 성공 run: $latest (${age}시간 전) · 임계 ${MAX_AGE}시간"
+
           if [ "$age" -gt "$MAX_AGE" ]; then
-            echo "::error::${age}시간째 성공한 수집이 없다. 러너가 죽었거나 맥이 꺼져 있다."
+            echo "::error::수집이 ${age}시간째 성공하지 못했다 (임계 ${MAX_AGE}시간). 러너 생존·맥 전원·스케줄 활성을 확인하라."
+            echo "::error:: 맥에서: ~/actions-runner-congress-api/svc.sh status"
             exit 1
           fi
+
+          echo "수집 정상 — 최근 성공이 임계 안에 있다."
