@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -64,9 +65,22 @@ CREATE TABLE IF NOT EXISTS committees (
     -- ⚠️ **FK 때문에 데이터를 버리지 마라.** 수집 중 모르는 위원회명을 만나면 거부하지 말고
     --    여기 먼저 자동 등록(UPSERT)한 뒤 진행한다. FK의 목적은 일관성이지 수집 차단이 아니다.
     --    대신 유사 중복(공백·중점 차이만 있는 두 행)은 감사 질의로 따로 잡는다.
-    committee_name   TEXT PRIMARY KEY,       -- 원천에 적힌 정식 명칭 그대로.
-                     -- '과학기술정보방송통신위원회' · '정보통신방송법안심사소위원회'
-                     -- 정규화하거나 약칭으로 바꾸지 마라 — 조인 키다.
+    committee_name   TEXT PRIMARY KEY,       -- 원천에 적힌 정식 명칭. 약칭으로 바꾸지 마라 — 조인 키다.
+                     -- ⚠️ **소위원회는 '상위 위원회 + 공백 + 소위명'이다.**
+                     --    '과학기술정보방송통신위원회 정보통신방송법안심사소위원회'
+                     --    소위 이름만으로 조회하면 **0건이 온다** — 그리고 0건은 에러가
+                     --    아니라 그대로 답이 되어 버린다. 이름을 모르면 추측하지 말고
+                     --    SELECT DISTINCT 로 확인하라.
+                     -- 왜 수식하나: 소위 이름이 상위를 넘어 중복된다. '법안심사제1소위원회'는
+                     --    법사위·행안위·복지위·정무위에 전부 있고(실측: 123회 중 표본 12개가
+                     --    상위 4곳), '예산결산기금심사소위원회'는 상위 5곳이었다. 맨 이름을
+                     --    키로 쓰면 서로 다른 위원회가 한 행으로 접혀 "이 소위 회의"가
+                     --    남의 위원회 회의를 섞어 준다.
+                     -- ⚠️ **표기는 먼저 본 쪽으로 모인다.** 두 원천이 같은 위원회를 다르게
+                     --    적는다 — likms '기후위기 특별위원회' / record '기후위기특별위원회'.
+                     --    upsert_committee 가 공백·중점을 지운 형태로 기존 행을 찾아 그
+                     --    표기를 쓰고 **실제로 저장된 이름을 돌려준다.** 자식 행은 반드시
+                     --    그 반환값으로 넣어라 — 넘긴 이름 그대로 넣으면 FK 위반이다.
     committee_class  TEXT,                   -- '상임위원회'|'특별위원회'|'예산결산특별위원회'|'소위원회'|…
     parent_committee TEXT REFERENCES committees(committee_name),
                      -- 소위원회면 상위 위원회. 아니면 NULL.
@@ -508,6 +522,64 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def init_schema(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    # 주석만 달라진 테이블은 여기서 조용히 최신화한다. 구조가 달라진 것은 손대지 않고
+    # 이름을 돌려주므로, 그건 사람이 봐야 한다.
+    if structural := migrate_comments(db):
+        print(f"⚠️ 구조가 달라진 테이블이 있다 (주석만이 아니다): {', '.join(structural)}\n"
+              f"   IF NOT EXISTS 라 기존 DB에 적용되지 않았다. 데이터를 옮기는 마이그레이션이 필요하다.",
+              file=sys.stderr)
+
+
+def _structure_only(sql: str) -> str:
+    """DDL에서 주석과 여분 공백을 걷어내 **구조만** 남긴다."""
+    return re.sub(r"\s+", " ", re.sub(r"--[^\n]*", "", sql)).strip()
+
+
+def migrate_comments(db: sqlite3.Connection) -> list[str]:
+    """드리프트가 **주석 차이뿐**인 테이블의 DDL 텍스트를 제자리에서 갈아 끼운다.
+
+    돌려주는 것은 **손대지 않은** 테이블들 — 구조까지 달라져 사람이 봐야 하는 것들이다.
+
+    왜 필요한가: DDL이 ``CREATE TABLE IF NOT EXISTS``라 기존 DB에는 주석 수정이 적용되지
+    않는다. 그런데 이 프로젝트에서 **주석이 곧 문서다** — 클로드가 읽는 1차 인터페이스가
+    `.schema` 출력이라 주석이 낡으면 문서가 낡는다. 그렇다고 주석 한 줄 고치는 데 수 시간짜리
+    재수집을 붙이면, 곧 주석을 안 고치게 되고 그게 이 설계의 가장 큰 자산을 깎는다.
+
+    ⚠️ **구조가 달라진 테이블은 건드리지 않는다.** 컬럼 추가·타입 변경·제약 변경은 데이터를
+       옮겨야 하는 진짜 마이그레이션이고, 그걸 이 함수가 몰래 하면 조용히 데이터를 잃는다.
+       주석과 공백만 다를 때에만 손댄다.
+    ⚠️ ``writable_schema``는 위험한 손잡이다 — 잘못 쓰면 DB가 열리지 않는다. 그래서
+       바꾸기 전에 구조가 같음을 확인하고, 바꾼 뒤 ``integrity_check``로 확인한다.
+    """
+    fresh = sqlite3.connect(":memory:")
+    fresh.executescript(SCHEMA)
+    want = {r[0]: r[1] for r in
+            fresh.execute("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+    have = {r[0]: r[1] for r in
+            db.execute("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
+
+    comment_only, structural = [], []
+    for n in sorted(want):
+        if n not in have or want[n] == have[n]:
+            continue
+        (comment_only if _structure_only(want[n]) == _structure_only(have[n])
+         else structural).append(n)
+    if not comment_only:
+        return structural
+
+    ver = db.execute("PRAGMA schema_version").fetchone()[0]
+    db.execute("PRAGMA writable_schema = ON")
+    try:
+        for n in comment_only:
+            db.execute("UPDATE sqlite_master SET sql = ? WHERE name = ?", (want[n], n))
+        # schema_version 을 올려야 다른 연결이 캐시된 옛 스키마를 버린다.
+        db.execute(f"PRAGMA schema_version = {ver + 1}")
+    finally:
+        db.execute("PRAGMA writable_schema = OFF")
+    if (r := db.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+        raise RuntimeError(f"주석 최신화 뒤 integrity_check 실패: {r}")
+    print(f"스키마 주석 최신화: {', '.join(comment_only)}", file=sys.stderr)
+    return structural
 
 
 def schema_drift(db: sqlite3.Connection) -> list[str]:
@@ -971,6 +1043,32 @@ def selftest(db_path: str) -> int:
     db.execute("ALTER TABLE bill_meetings RENAME TO bill_meetings_x")
     db.execute("CREATE TABLE bill_meetings (bill_no TEXT, conference_id INTEGER)")  # 주석 없는 옛 정의 흉내
     check("주석이 사라진 테이블을 드리프트로 잡는다", "bill_meetings" in schema_drift(db))
+
+    # ── 주석 최신화: 갈아 끼우는 쪽과 **거부하는** 쪽을 둘 다 본다
+    def _fake(conn, old: str, new: str) -> None:
+        """옛 DB 를 흉내낸다 — 저장된 DDL 텍스트만 바꾼다."""
+        v = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute("PRAGMA writable_schema = ON")
+        conn.execute("UPDATE sqlite_master SET sql = replace(sql, ?, ?) WHERE name='committees'",
+                     (old, new))
+        conn.execute(f"PRAGMA schema_version = {v + 1}")
+        conn.execute("PRAGMA writable_schema = OFF")
+
+    a = sqlite3.connect(":memory:")
+    a.isolation_level = None
+    a.executescript(SCHEMA)
+    _fake(a, "조인 키다", "조인 키다(옛 주석)")
+    check("주석이 어긋나면 드리프트다", "committees" in schema_drift(a))
+    check("주석만 다르면 갈아 끼운다",
+          migrate_comments(a) == [] and schema_drift(a) == [], str(schema_drift(a)))
+
+    b = sqlite3.connect(":memory:")
+    b.isolation_level = None
+    b.executescript(SCHEMA)
+    _fake(b, "committee_class  TEXT,", "committee_class  TEXT, zzz TEXT,")
+    # ⚠️ 여기서 조용히 갈아 끼우면 실제 저장 구조와 DDL 이 어긋나 데이터를 잃는다.
+    check("구조가 다르면 손대지 않고 이름만 돌려준다",
+          migrate_comments(b) == ["committees"] and "committees" in schema_drift(b))
 
     print(f"\n{'실패 ' + str(len(fails)) + '건: ' + ', '.join(fails) if fails else '전부 통과'}")
     return 1 if fails else 0
