@@ -793,6 +793,16 @@ BILL_LIST_COLS = ("bill_id", "assembly_unit", "bill_kind", "title", "proposer_ki
                   "proposer_summary", "date_proposed", "date_decided", "decision_result",
                   "review_status")
 
+#: 목록이 **행을 처음 만들 때만** 쓰는 컬럼. 재수집이 상세의 값을 덮으면 안 된다.
+#:
+#: ⚠️ ``bill_kind`` 는 목록에 아예 없는 값이다 — 목록 표의 컬럼은 여덟 개고(의안번호·의안명·
+#:    제안자구분·제안일자·의결일자·의결결과·제안이유·심사진행상태) 의안종류가 없다. 그래서
+#:    목록 수집은 ``'미상'`` 을 넣고 상세가 ``billKindCd`` 로 덮는 구조인데, 여기 UPDATE 절에
+#:    들어 있으면 **매 실행의 목록 패스가 상세의 값을 도로 '미상' 으로 되돌린다.**
+#:    실측으로 20,598건 전부 그렇게 됐고, 그 사이 ``bill_detail_missing`` 게이트는
+#:    ``bill_kind='법률안'`` 인 행을 세느라 **아무것도 검사하지 않으면서 초록불**이었다.
+BILL_LIST_INSERT_ONLY = ("bill_kind",)
+
 
 def upsert_bill_list(db: sqlite3.Connection, row: dict) -> None:
     """목록 행을 넣거나 갱신한다. **이미 받아 둔 상세 컬럼은 건드리지 않는다.**
@@ -813,7 +823,7 @@ def upsert_bill_list(db: sqlite3.Connection, row: dict) -> None:
     now = now_str()
     names = ["bill_no", *cols, "collected_at", "updated_at"]
     vals = [row["bill_no"], *cols.values(), now, now]
-    sets = ", ".join(f"{c} = excluded.{c}" for c in cols)
+    sets = ", ".join(f"{c} = excluded.{c}" for c in cols if c not in BILL_LIST_INSERT_ONLY)
     db.execute(
         f"""INSERT INTO bills ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})
             ON CONFLICT(bill_no) DO UPDATE SET {sets}, updated_at = excluded.updated_at""",
@@ -1051,13 +1061,18 @@ def selftest(db_path: str) -> int:
     upsert_bill_list(db, {"bill_no": "2214631", "bill_id": "PRC_A", "assembly_unit": 22,
                           "bill_kind": "법률안", "title": "소프트웨어 진흥법 일부개정법률안",
                           "review_status": "위원회 심사"})
-    db.execute("UPDATE bills SET reason_text = '제안이유 본문', detail_collected_at = ? "
-               "WHERE bill_no = '2214631'", (now_str(),))
+    db.execute("UPDATE bills SET reason_text = '제안이유 본문', detail_collected_at = ?, "
+               "bill_kind = '법률안' WHERE bill_no = '2214631'", (now_str(),))
+    # 목록 재수집은 bill_kind 를 모르므로 늘 '미상' 을 들고 온다 — 그게 상세의 값을 덮으면 안 된다
     upsert_bill_list(db, {"bill_no": "2214631", "bill_id": "PRC_A", "assembly_unit": 22,
-                          "bill_kind": "법률안", "title": "소프트웨어 진흥법 일부개정법률안",
+                          "bill_kind": "미상", "title": "소프트웨어 진흥법 일부개정법률안",
                           "review_status": "본회의 통과"})
-    r = db.execute("SELECT reason_text, detail_collected_at, review_status "
+    r = db.execute("SELECT reason_text, detail_collected_at, review_status, bill_kind "
                    "FROM bills WHERE bill_no='2214631'").fetchone()
+    # ⚠️ 이게 깨지면 bill_detail_missing 게이트가 '법률안' 행을 하나도 못 찾아
+    #    아무것도 검사하지 않으면서 초록불이 된다. 실측으로 20,598건 전부 그렇게 됐다.
+    check("목록 재갱신이 bill_kind를 '미상'으로 되돌리지 않는다", r["bill_kind"] == "법률안",
+          r["bill_kind"])
     check("목록 재갱신이 reason_text를 보존한다", r["reason_text"] == "제안이유 본문")
     check("목록 재갱신이 detail_collected_at을 보존한다", bool(r["detail_collected_at"]))
     check("목록 재갱신이 변한 상태는 반영한다", r["review_status"] == "본회의 통과")

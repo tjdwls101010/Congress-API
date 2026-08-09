@@ -67,6 +67,20 @@ GATES: dict[str, tuple[str, str]] = {
           AND NOT EXISTS (SELECT 1 FROM collect_failures f
                           WHERE f.target_kind='meeting_body'
                             AND f.target_key=CAST(bm.conference_id AS TEXT))"""),
+    "text_contamination": ("본문 컬럼에 페이지 부속물이 섞인 행. **0이 정상이다**", """
+        -- 이 도메인의 오류는 에러가 아니라 값 안에 섞여 들어온 남의 글자로 나타난다.
+        -- 실제로 나왔던 것들: 목록 배지('계류의안'), 표 칸 라벨('공포번호 20676'),
+        -- UI 버튼('철회자 목록'), 그리고 제안이유에 통째로 들어간 <script> 소스.
+        -- 마지막 것은 20,598건 **전량**이었고 이 컬럼이 키워드 검색의 주 대상이라
+        -- 검색이 자바스크립트를 물고 있었다.
+        SELECT (SELECT COUNT(*) FROM bills
+                WHERE reason_text LIKE '%창닫기%' OR reason_text LIKE '%innerHTML%'
+                   OR reason_text LIKE '%찾을 수 없습니다%'
+                   OR title LIKE '%계류의안%' OR title LIKE '%처리의안%')
+             + (SELECT COUNT(*) FROM bill_stages
+                WHERE result LIKE '%<%>%' OR ref_no LIKE '%공포번호%'
+                   OR date_processed LIKE '%일자%')
+             + (SELECT COUNT(*) FROM bill_meetings WHERE meeting_name LIKE '%회의결과%')"""),
     "unresolved_retriable": ("상한 미달의 재시도 대상이 없다", f"""
         SELECT COUNT(*) FROM collect_failures
         WHERE kind='retriable' AND attempts < {dbm.MAX_ATTEMPTS}"""),
