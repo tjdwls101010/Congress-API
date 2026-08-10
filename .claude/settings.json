@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run .claude/skills/congress/Scripts/audit.py:*)",
+      "Bash(uv run .claude/skills/congress/Scripts/verify.py:*)",
+      "Bash(uv run .claude/skills/congress/Scripts/collect.py --audit-only:*)",
+      "Bash(uv run .claude/skills/congress/Scripts/db.py schema:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr view:*)"
+    ],
+    "deny": [
+      "Bash(git clean:*)"
+    ]
+  }
+}
