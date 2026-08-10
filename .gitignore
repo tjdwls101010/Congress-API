@@ -1,10 +1,12 @@
 # 참고용 심볼릭 링크 (Naver-News 저장소를 가리킨다)
 .tmp/
 
-# 수집 DB — 재구축이 가능하고 매번 통째로 바뀌는 바이너리라 커밋하지 않는다
-.claude/skills/congress/CONGRESS.db
-.claude/skills/congress/CONGRESS.db-wal
-.claude/skills/congress/CONGRESS.db-shm
+# 수집 DB — 재구축이 가능하고 매번 통째로 바뀌는 바이너리라 커밋하지 않는다.
+# 이름을 박지 말고 글롭으로 둔다 — 개편 때 CONGRESS.v1.db 같은 대조군을 옆에 두는데,
+# 파일명을 하나씩 적어 두면 그게 677MB짜리 untracked 로 남아 커밋 사고를 기다린다.
+.claude/skills/congress/CONGRESS*.db
+.claude/skills/congress/CONGRESS*.db-wal
+.claude/skills/congress/CONGRESS*.db-shm
 .claude/skills/congress/*.lock
 
 # Python
