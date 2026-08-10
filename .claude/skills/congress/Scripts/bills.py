@@ -20,6 +20,7 @@ import argparse
 import re
 import sys
 import threading
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -35,16 +36,30 @@ INFO = f"{net.LIKMS}/bill/bi/bill/detail/billInfo.do"
 VOTE = f"{net.LIKMS}/bill/bi/bill/detail/voteInfo.do"
 PROPOSER = f"{net.LIKMS}/bill/bi/popup/billProposer.do"
 SUMMARY = f"{net.LIKMS}/bill/bi/popup/billSummary.do"
+ANBILL = f"{net.LIKMS}/bill/bi/bill/detail/anBillInfo.do"
+
+#: 의안 마일스톤 JSON. **HTML 표에서 유도하지 말고 여기서 받는다.**
+#:
+#: ⚠️ 경로 앞의 ``/bill`` 을 빼면 안 된다. 상세 페이지의 JS 는 ``/bi/common/findBillDetail.do``
+#:    라고 적어 두었지만(헬퍼가 접두어를 붙인다), 그 경로를 그대로 부르면 **200 에 euc-kr
+#:    레거시 에러 페이지**가 온다 — 404 가 아니라 200 이라 성공으로 읽힌다.
+#: ⚠️ 응답은 ``{"data": {...}}`` 로 한 겹 싸여 있다.
+#: 폼도 _csrf 도 필요 없다. billNo 하나로 GET 이고 550바이트다.
+FINDDETAIL = f"{net.LIKMS}/bill/bi/common/findBillDetail.do"
 
 #: caption 앞머리 → bill_stages.stage.
 #:
 #: ⚠️ caption 텍스트로 판별한다. 클래스나 순서에 의존하지 마라 — 의안마다 있는 테이블이 다르다.
-#: ⚠️ '정보이송정보'는 오타가 아니다. 화면 제목은 '정부이송정보'인데 caption 은 그렇게 적혀 있다.
+#: '관련위 심사정보'·'정보이송정보'·'공포정보'는 여기 없다. 앞의 둘은 담을 사실이 없어
+#: 버렸고(db.py 의 bill_stages.stage 주석), 공포정보는 단계가 아니라
+#: bill_promulgated_laws 로 간다 — 아래 PROMULGATION_CAPTION.
 STAGE_BY_CAPTION = {
-    "소관위 심사정보": "소관위", "소위 심사정보": "소위", "관련위 심사정보": "관련위",
+    "소관위 심사정보": "소관위", "소위 심사정보": "소위",
     "법사위 체계자구 심사정보": "체계자구", "본회의 심의정보": "본회의",
-    "정보이송정보": "정부이송", "공포정보": "공포",
 }
+#: 공포된 법률 목록. **단계가 아니라 별도 표다** — 일괄개정은 의안 하나가 법률 여러 개를 공포한다.
+PROMULGATION_CAPTION = "공포정보"
+
 #: 회의록 id 가 나오는 테이블들 → bill_meetings.stage
 MEETING_CAPTIONS = {"소관위 회의정보": "소관위", "법사위 회의정보": "체계자구",
                     "본회의 심의정보": "본회의"}
@@ -56,14 +71,18 @@ MEETING_CAPTIONS = {"소관위 회의정보": "소관위", "법사위 회의정�
 #:    읽으면 의결결과 자리에 회의명이 들어가고, '관련위 심사정보'는 처리결과 칸이 아예
 #:    없어(의견서제시일이 끝이다) 넷째 칸을 결과로 읽으면 '문서'가 들어간다.
 #:    원천은 값 칸마다 class 를 달아 두었고 그게 열 순서보다 안정적이다.
+#: 상정일(presentDt)은 받지 않는다 — 소관위·소위 모두 98% 가 첫 회의일과 같아
+#: bill_meetings 가 답한다(db.py 의 bill_stages 주석).
 STAGE_CELLS = {
     "committeeName": "committee_name", "submitDt": "date_referred",
-    "presentDt": "date_presented", "inscResultCd": "result", "announceNo": "ref_no",
-    # 처리일의 이름이 단계마다 다르다: 처리일 · 의견서제시일 · 정부이송일 · 공포일자.
-    # 한 행에 둘이 함께 오는 경우는 없다.
-    "procDt": "date_processed", "govTransDt": "date_processed",
-    "announceDt": "date_processed",
+    "inscResultCd": "result", "procDt": "date_processed",
 }
+
+#: 체계자구 단계의 위원회는 **표에 칸이 없고 caption 이 곧 값이다**('법사위 체계자구 심사정보').
+#: v1 은 그래서 1,501행 전부 NULL 이었는데, 그러면 `committee_name='법제사법위원회'` 조회가
+#: 그 1,501건을 조용히 놓친다 — 스키마 주석은 "체계자구는 언제나 법사위"라고 말하는데
+#: 데이터는 그렇지 않은 상태다. 채워서 둘을 맞춘다.
+LEGISLATION_COMMITTEE = "법제사법위원회"
 
 #: 상세를 동시에 받는 워커 수. **실측으로 정했고 근거가 collect_details 주석에 있다.**
 DEFAULT_WORKERS = 6
@@ -197,10 +216,10 @@ def cell_values(tr) -> dict[str, str]:
     return out
 
 
-def parse_info(html: str) -> tuple[list[dict], list[dict], dict]:
-    """caption 테이블 → 심사 단계 · 회의 · bills 보강값."""
+def parse_info(html: str) -> tuple[list[dict], list[dict], list[dict], dict]:
+    """caption 테이블 → 심사 단계 · 회의 · 공포법률 · bills 보강값."""
     tree = HTMLParser(html)
-    stages, meetings, extra = [], [], {}
+    stages, meetings, laws, extra = [], [], [], {}
 
     for table in tree.css("table"):
         cap = table.css_first("caption")
@@ -212,7 +231,12 @@ def parse_info(html: str) -> tuple[list[dict], list[dict], dict]:
             continue
 
         if head == "의안접수정보":
-            extra["proposal_session"] = rows[0][1].get("sessionTitle")
+            # ⚠️ **'제N회'를 집어야 한다. 첫 숫자가 아니다.** 원천은
+            #    '제22대(2024~2028)제417회' 로 주므로 맨 앞 숫자를 잡으면 대수(22)가
+            #    회기 자리에 들어간다 — 전 행이 22가 되고 그래도 정수라 아무도 못 알아챈다.
+            #    문자열로 두면 회기 범위 질의가 사전순 비교로 조용히 틀린다.
+            if m := re.search(r"제\s*(\d+)\s*회", rows[0][1].get("sessionTitle") or ""):
+                extra["proposal_session"] = int(m.group(1))
         elif head == "정부재의안":
             # 재의(대통령 거부권) 결과의 **구조화된 원천**이다. 03번은 이 값이 오직
             # bill_memo 산문에만 있다고 적었는데, 실측해 보니 caption 테이블이 따로 있고
@@ -236,20 +260,30 @@ def parse_info(html: str) -> tuple[list[dict], list[dict], dict]:
                     "result": c.get("procResultName") or c.get("inscResultCd"),
                 })
 
+        if head == PROMULGATION_CAPTION:
+            for _tr, c in rows:
+                # ⚠️ 공포법률명은 의안명과 다르다 — '…기본법안(대안)' → '…기본법'.
+                #    바깥 자료와 이름으로 맞출 때 쓰는 것은 이쪽이다.
+                # ⚠️ **같은 법률명이 두 행으로 오는 의안이 있다**(실측 2215141·2206640).
+                #    PK 가 (bill_no, law_name) 이라 그대로 넣으면 UNIQUE 위반으로 그 의안의
+                #    상세가 통째로 롤백된다 — 남는 것이 없어지는 쪽이 훨씬 나쁘다.
+                if (name := c.get("lawName")) and name not in {l["law_name"] for l in laws}:
+                    laws.append({"law_name": name, "law_no": c.get("announceNo")})
+            continue
+
         if head not in STAGE_BY_CAPTION:
             continue
         stage = STAGE_BY_CAPTION[head]
         for _tr, c in rows:
             row = {"stage": stage, "committee_name": None, "date_referred": None,
-                   "date_presented": None, "date_processed": None, "result": None,
-                   "ref_no": None, "doc_url": None, "seq": 1}
+                   "date_processed": None, "result": None, "seq": 1}
             for cls, field in STAGE_CELLS.items():
                 if c.get(cls) is not None:
                     row[field] = c[cls]
-            if name := c.get("lawName"):
-                # ⚠️ 공포법률명은 의안명과 다르다 — '…기본법안(대안)' → '…기본법'.
-                #    바깥 자료와 이름으로 맞출 때 쓰는 것은 이쪽이다.
-                extra["promulgated_law_name"] = name
+            # 체계자구는 표에 위원회 칸이 없고 caption 이 곧 값이다. 비워 두면
+            # `committee_name='법제사법위원회'` 조회가 이 단계를 통째로 놓친다.
+            if stage == "체계자구" and not row["committee_name"]:
+                row["committee_name"] = LEGISLATION_COMMITTEE
             stages.append(row)
 
     # bill_memo — caption 테이블 **밖**이라 caption 매칭 파서로는 절대 못 잡는다.
@@ -271,28 +305,28 @@ def parse_info(html: str) -> tuple[list[dict], list[dict], dict]:
                 s["parent"] = owner
                 s["committee_name"] = f"{owner} {s['committee_name']}"
 
-    # seq — **파싱 순서가 아니라 정렬 순위다.** 근거는 db.py 의 bill_stages.seq 주석:
-    # 보이는 순서대로 매기면 원천이 행을 재정렬하거나 앞에 끼워 넣는 순간 같은 사건이
-    # 다른 seq 를 받아 UPSERT 가 덮어쓰기 대신 **삽입**으로 동작한다 — 에러 없이 행만 는다.
-    # 관련위가 6행인 의안(2215928)이 실제로 이 규칙이 필요한 자리다.
+    # seq — 정렬 순위로 매긴다. 다만 **여기에 멱등성을 걸지는 않는다.**
+    # 소위는 절반이 committee_name 이 비어 정렬 타이가 남고, 타이가 뒤집히면 같은 사건이
+    # 다른 seq 를 받는다. 그래서 쓰기 쪽이 UPSERT 가 아니라 DELETE+INSERT 다
+    # (db.py 의 replace_children_txn). 이 정렬은 사람이 읽을 때의 순서일 뿐이다.
     for stage in {s["stage"] for s in stages}:
         group = sorted((s for s in stages if s["stage"] == stage),
-                       key=lambda s: (s["date_referred"] or s["date_presented"]
-                                      or s["date_processed"] or "",
+                       key=lambda s: (s["date_referred"] or s["date_processed"] or "",
                                       s["committee_name"] or ""))
         for i, s in enumerate(group, 1):
             s["seq"] = i
-    return stages, meetings, extra
+    return stages, meetings, laws, extra
 
 
-def parse_votes(html: str) -> tuple[dict, list[dict], int]:
-    """표결 요약과 의원별 표. 돌려주는 셋째 값은 **slug 없는 표의 수**다.
+def parse_votes(html: str) -> tuple[dict, list[dict], list[dict]]:
+    """표결 요약과 의원별 표. 돌려주는 셋째 값은 **slug 없는 표들**이다.
 
     ⚠️ 명단은 찬성·반대·기권 셋뿐이고 **불참 명단은 없다.** 행이 없는 것은 불참이 아니라
        "그 의원의 표를 우리가 모른다"이다. 불참을 세려면 재적·재석 숫자로 계산하라.
     ⚠️ 이름은 있는데 ``/members/`` 링크가 없는 li 가 있다(실측: 찬성 193 중 8).
-       PK 가 slug 라 저장할 방법이 없으므로 **그 수를 세어 돌려준다** — 조용히 버리면
-       "표결 행 수 == 찬성+반대+기권"이 영영 안 맞는데 이유를 알 수 없게 된다.
+       PK 가 slug 라 그대로는 저장할 수 없다. **이름을 들고 돌려주면** 호출자가
+       members 로 이름을 맞춰 회수할 수 있다 — 조용히 버리면 "표결 행 수 ==
+       찬성+반대+기권"이 영영 안 맞는데 이유를 알 수 없게 된다.
     """
     tree = HTMLParser(html)
     text = re.sub(r"\s+", " ", tree.body.text(separator=" ") if tree.body else "")
@@ -303,29 +337,26 @@ def parse_votes(html: str) -> tuple[dict, list[dict], int]:
     if d := re.search(r"(\d{4}-\d{2}-\d{2})", text):
         summary["date_voted"] = d.group(1)
 
-    votes, missing = [], 0
+    votes, unlinked = [], []
     for uid, label in (("voteAgreeList", "찬성"), ("voteDisAgreeList", "반대"),
                        ("voteAbsList", "기권")):
         ul = tree.css_first(f"#{uid}")
         if ul is None:
             continue
         for li in ul.css("li"):
-            if not li.text(strip=True):
+            if not (txt := dbm.norm_text(li.text(strip=True))):
                 continue
             a = li.css_first('a[href*="/members/"]')
             if a is None:
-                missing += 1
+                unlinked.append({"name": txt, "vote": label})
                 continue
             votes.append({"open_na_id": a.attributes["href"].rstrip("/").split("/")[-1],
                           "vote": label})
-    return summary, list({v["open_na_id"]: v for v in votes}.values()), missing
+    return summary, list({v["open_na_id"]: v for v in votes}.values()), unlinked
 
 
-def parse_proposers(html: str, represent: str | None) -> list[dict]:
-    """발의자 명단. 대표발의는 상세 페이지 카드가 정하고 나머지는 공동발의다.
-
-    한글명·한자명·정당을 한 번에 준다. 표결 명단은 이름만 주고 의원 상세는 1인 1요청이라,
-    정당이 공짜로 오는 자리가 여기다.
+def parse_proposer_page(html: str) -> tuple[list[dict], dict]:
+    """발의자 팝업 한 페이지 → (명단, 숨은 필드).
 
     ⚠️ **앵커 *뒤*의 텍스트를 읽으면 안 된다.** 한 명이 사진 카드로 오고 값은 앵커 *안*에 있다:
 
@@ -336,17 +367,163 @@ def parse_proposers(html: str, represent: str | None) -> list[dict]:
        전부 None 으로 들어간다.** 200 이고 발의자 수도 맞아서 어디서도 안 걸린다 —
        실측에서 의원 332명 **전원**의 party 가 NULL 이었던 원인이 이것이다.
     """
+    tree = HTMLParser(html)
+    hidden = {}
+    for h in tree.css("input[type=hidden]"):
+        key = h.attributes.get("id") or h.attributes.get("name")
+        if key:
+            hidden[key] = h.attributes.get("value") or ""
     out = []
-    for a in HTMLParser(html).css('a[href*="/members/22nd/"]'):
+    for a in tree.css('a[href*="/members/22nd/"]'):
         slug = a.attributes["href"].rstrip("/").split("/")[-1]
         party = next((p.text(strip=True) for p in a.css("p.jdang")), None)
         plain = [t for p in a.css("p") if (t := p.text(strip=True)) and t != party]
         out.append({"open_na_id": slug,
-                    "role": "대표발의" if slug == represent else "공동발의",
-                    "name": plain[0] if plain else None,
-                    "name_hanja": plain[1] if len(plain) > 1 else None,
-                    "party": party})
-    return list({p["open_na_id"]: p for p in out}.values())
+                    "name": dbm.norm_text(plain[0]) if plain else None,
+                    "name_hanja": dbm.norm_text(plain[1]) if len(plain) > 1 else None,
+                    "party": dbm.norm_text(party)})
+    return out, hidden
+
+
+def lead_names(info: str | None) -> list[str]:
+    """팝업의 ``info`` 에서 **대표발의자 이름들**을 뽑는다.
+
+    ``'최형두의원ㆍ이준석의원ㆍ황정아의원 등 11인'`` → ``['최형두', '이준석', '황정아']``
+    ``'김석기의원 등 191인'``                        → ``['김석기']``
+    ``'김준형의원 외 22인'``                         → ``['김준형']``
+    ``'행정안전위원장'``                             → ``[]``
+
+    ⚠️ **대표발의가 한 명이라는 가정이 v1 의 결함이었다.** 상세 HTML 의 첫 ``/members/``
+       링크만 대표로 잡아서 ``role='대표발의'`` 가 2명 이상인 의안이 **0건**이었다.
+       원천은 여기서 전원을 직접 말해 준다 — 순서나 위치가 아니라 선언된 값이다.
+    ⚠️ **꼬리가 ``등 N인`` 만이 아니다. ``외 N인`` 도 있다**(실측 44건). ``등`` 만 끊으면
+       그 44건은 이름 부분이 ``'김준형의원 외 22인'`` 통째로 남아 어느 항목과도 안 맞고,
+       **대표발의가 한 명도 없는 의안**이 된다 — 에러 없이 role 이 전부 공동발의가 된다.
+    """
+    if not info:
+        return []
+    head = dbm.norm_text(re.split(r"\s*[등외]\s*\d+\s*인", info)[0]) or ""
+    return [n for part in head.split("·") if (n := re.sub(r"의원\s*$", "", part).strip())
+            and part.strip().endswith("의원")]
+
+
+def fetch_proposers(session: net.Session, bill_id: str, bill_no: str) -> tuple[list[dict], int]:
+    """발의자 **전원**과 원천이 선언한 총원.
+
+    ⚠️ **원천이 14명씩 페이징한다.** v1 은 1페이지만 읽어 191명짜리 의안에서 14명만
+       가져왔고, 전체로는 34,270명이 사라졌다. 그런데 200 이고 파싱도 성공해서
+       어디서도 안 걸렸다.
+    ⚠️ **빈 응답을 종료 조건으로 쓰지 마라 — 무한 루프다.** ``page`` 가 마지막을 넘으면
+       에러가 아니라 **마지막 페이지를 다시 준다.** 그래서 원천이 선언한
+       ``pager_pages_text``(``' (1/14 페이지)'``)로 페이지 수를 먼저 정하고 그만큼만 돈다.
+    """
+    def one(page: int) -> tuple[list[dict], dict]:
+        r = session.xhr(PROPOSER, {"billId": bill_id, "billNo": bill_no, "page": str(page),
+                                   "_csrf": session.likms_csrf()},
+                        referer=net.LIKMS_SEARCH_PAGE)
+        return parse_proposer_page(r.text)
+
+    rows, hidden = one(1)
+    # 총원은 같은 응답 안의 **독립적인 출처**다. 제목의 '등 N인' 을 쓰지 마라 —
+    # '외 N인' 44건과 위원장·정부 발의 1,654건에서 깨진다.
+    declared = int(re.sub(r"[^\d]", "", hidden.get("pager_count_text") or "0") or 0)
+    pages = 1
+    if m := re.search(r"/\s*(\d+)\s*페이지", hidden.get("pager_pages_text") or ""):
+        pages = int(m.group(1))
+    leads = set(lead_names(hidden.get("info")))
+    for p in range(2, pages + 1):
+        more, _ = one(p)
+        rows.extend(more)
+
+    seen: dict[str, dict] = {}
+    for r in rows:
+        r["role"] = "대표발의" if r["name"] in leads else "공동발의"
+        seen.setdefault(r["open_na_id"], r)
+    return list(seen.values()), declared
+
+
+def parse_alternatives(html: str) -> tuple[str | None, list[str]]:
+    """대안 탭 → ``(흡수한 대안의 의안번호, 흡수된 원안 의안번호들)``.
+
+    **한 번의 요청이 양방향을 다 준다.** 원안을 물어도 대안을 물어도 같은 표가 오고,
+    의미가 방향에 상관없이 같다 — caption ``'대안반영'`` 한 행이 대안이고,
+    caption ``'대안반영폐기'`` 의 N행이 그 대안에 흡수된 원안 전부다(자기 자신 포함).
+    그래서 의안 하나를 받으면 형제 전부의 관계까지 한꺼번에 만들어진다.
+
+    ⚠️ **원천이 같은 표를 두 벌 낸다**(실측: caption 이 네 개인데 내용은 두 개다).
+       그대로 읽으면 행이 두 배가 된다. caption 첫 등장만 쓴다.
+    """
+    tree = HTMLParser(html)
+    alt: str | None = None
+    absorbed: list[str] = []
+    seen: set[str] = set()
+    for table in tree.css("table"):
+        cap = table.css_first("caption")
+        if cap is None:
+            continue
+        head = re.split(r"\s*:", cap.text(strip=True))[0].strip()
+        if head not in ("대안반영", "대안반영폐기") or head in seen:
+            continue
+        seen.add(head)
+        nos = []
+        for tr in table.css("tr"):
+            c = cell_values(tr)
+            no = c.get("billNo")
+            if not no and (m := re.search(r"\b(2\d{6})\b", tr.text(separator=" "))):
+                no = m.group(1)
+            if no:
+                nos.append(no)
+        if head == "대안반영":
+            alt = nos[0] if nos else None
+        else:
+            absorbed = nos
+    return alt, absorbed
+
+
+#: 계류 의안의 상세를 다시 받는 주기(일). 심사단계는 계류 중에도 계속 움직이므로
+#: 한 번 받고 두면 **14,000건이 영원히 낡는다** — v2 가 존재하는 이유의 절반이 이것이다.
+DEFAULT_REFRESH_DAYS = 30
+
+
+def todo_sql(refresh_days: int = DEFAULT_REFRESH_DAYS) -> tuple[str, list]:
+    """상세를 받아야 할 의안. **collect.py 와 공유한다** — 두 곳에 적으면 갈라진다.
+
+    받아야 할 이유가 넷이다:
+
+    1. 아직 안 받았다 (``detail_collected_at IS NULL``)
+    2. 원장에 살아 있는 실패가 붙어 있다 — 없으면 한 번 받은 뒤 실패한 재수집이 영영
+       재시도되지 않고 ``unresolved_retriable`` 이 영구히 빨갛다
+    3. **목록이 그 뒤에 바뀌었다** (``updated_at > detail_collected_at``)
+    4. **계류인데 오래됐다** — 이게 없으면 계류 14,000건의 심사단계가 굳는다
+
+    ⚠️ 상한 초과분을 빼는 마지막 절이 없으면 **영구 재시도 루프**가 된다. 발의자 수가
+       안 맞으면 ``detail_collected_at`` 을 안 쓰므로, 상한(5회)을 넘겨도 1번 조건이
+       계속 참이라 매 실행이 같은 의안을 다시 받는다.
+    ⚠️ 주기 비교를 SQL 의 ``datetime('now','-30 day')`` 로 하지 마라. 그건 **UTC** 인데
+       우리가 저장하는 시각은 ``dbm.now_str()`` 의 **KST** 라 9시간이 어긋난다.
+       경계선의 의안이 하루 일찍/늦게 걸리고, 그 어긋남은 아무 에러도 내지 않는다.
+       그래서 기준 시각을 파이썬에서 KST 로 계산해 넘긴다.
+    """
+    cutoff = (datetime.now(dbm.KST) - timedelta(days=refresh_days)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = """
+        SELECT bill_no, bill_id FROM bills
+        WHERE (bill_kind = '법률안' OR bill_kind = '미상')
+          AND (detail_collected_at IS NULL
+               -- ⚠️ **bill_detail 만 보면 안 된다.** 발의자·표결·대안이 실패한 의안은
+               --    상세 자체는 성공해서 detail_collected_at 이 찍혀 있다. 그것만 보면
+               --    그 의안은 **영영 다시 안 받아지고** 원장의 실패가 영구히 남는다.
+               --    상한(attempts)이 무한 재시도를 막으므로 넓혀도 안전하다.
+               OR EXISTS (SELECT 1 FROM collect_failures f
+                          WHERE f.target_kind IN ('bill_detail','bill_vote',
+                                                  'bill_proposer','bill_alt')
+                            AND f.target_key=bills.bill_no
+                            AND f.kind='retriable' AND f.attempts < ?)
+               OR updated_at > detail_collected_at
+               OR (outcome = '계류' AND detail_collected_at < ?))
+          AND NOT EXISTS (SELECT 1 FROM collect_failures f2
+                          WHERE f2.target_kind='bill_detail' AND f2.target_key=bills.bill_no
+                            AND (f2.kind='gone' OR f2.attempts >= ?))"""
+    return sql, [dbm.MAX_ATTEMPTS, cutoff, dbm.MAX_ATTEMPTS]
 
 
 def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool:
@@ -366,7 +543,11 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
             raise ValueError(f"다른 의안의 문서가 왔다 (요청 {bill_no} / 문서 {f.get('billNo')})")
         info = session.xhr(INFO, {**f, "_csrf": session.likms_csrf()},
                            referer=net.LIKMS_SEARCH_PAGE).text
-        stages, meetings, extra = parse_info(info)
+        stages, meetings, laws, extra = parse_info(info)
+        # 마일스톤은 HTML 표에서 유도하지 않고 JSON 에서 받는다. 550바이트 · GET · 폼 불필요.
+        js = session.get(f"{FINDDETAIL}?billNo={bill_no}").json()["data"]
+        if js.get("billNo") != bill_no:
+            raise ValueError(f"JSON 이 다른 의안이다 (요청 {bill_no} / 응답 {js.get('billNo')})")
     except Exception as e:
         dbm.record_failure(db, "bill_detail", bill_no, detail=f"parse:{type(e).__name__}: {e}")
         return False
@@ -374,8 +555,13 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
     extra["bill_kind"] = f.get("billKindCd") or None
     extra["is_reexamination"] = 1 if f.get("reexamYn") == "Y" else 0
     extra["withdraw_count"] = int(f.get("withdrawCnt") or 0)
-    extra["alt_bill_id"] = f.get("selRefBillId") or None
-    extra["head_memo"] = (f.get("headMemoInfo") or "").strip() or None
+    extra["ref_bill_id"] = f.get("selRefBillId") or None
+    extra["head_memo"] = dbm.norm_text(f.get("headMemoInfo"))
+    # JSON 이 직접 말해 주는 것들. v1 은 committee_name 을 HTML 에서 유도하려다 19,985건
+    # 전부 NULL 이었다.
+    extra["current_committee"] = dbm.norm_text(js.get("currCmt"))
+    extra["date_transferred"] = js.get("govTransDt") or None
+    extra["date_promulgated"] = js.get("announceDt") or None
     try:
         s = session.get(f"{SUMMARY}?billId={bill_id}")
         if s.status_code == 200:
@@ -392,26 +578,85 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
         pass   # 제안이유는 없을 수 있다. 판정자로 쓰지 않으므로 실패해도 진행한다
 
     votes = proposers = None
-    vote_missing = 0
+    declared = None
+    vote_unlinked: list[dict] = []
+    alt_edges: list[dict] = []
+    # ⚠️ **하위 실패는 성공하면 반드시 지워야 한다.** 안 지우면 한 번 실패한 의안이
+    #    고쳐진 뒤에도 원장에 남아 unresolved_retriable 이 영구히 빨갛고, 그러면 사람이
+    #    게이트 표 전체를 안 믿게 된다. 이번 패스에서 실패한 종류만 남기고 나머지는 지운다.
+    sub_failed: set[str] = set()
+
+    def sub_fail(kind: str, detail: str) -> None:
+        sub_failed.add(kind)
+        dbm.record_failure(db, kind, bill_no, detail=detail)
     if any(st["stage"] == "본회의" for st in stages):
         try:
-            vs, vlist, vote_missing = parse_votes(
-                session.xhr(VOTE, {"billId": bill_id, "_csrf": session.likms_csrf()},
+            # ⚠️ **폼 전체를 보낸다.** {billId, _csrf} 만 보내면 400 "Bad Request." 12바이트가
+            #    오고, 우리는 그걸 "원천이 표결을 안 준다"로 읽었다 — 수정가결 22건의 표결이
+            #    없다던 진단이 사실은 우리 요청 문제였다. 바로 위 billInfo.do 가 이미 같은
+            #    폼을 보내고 있으므로 그대로 재사용하면 된다.
+            vs, vlist, vote_unlinked = parse_votes(
+                session.xhr(VOTE, {**f, "_csrf": session.likms_csrf()},
                             referer=net.LIKMS_SEARCH_PAGE).text)
             votes = (vs, vlist)
+            # ⚠️ **"표결이 없다"와 "표결을 못 받았다"를 가른다.** 본회의 단계가 있어도
+            #    표결 집계가 없는 의안이 정상으로 존재한다 — 대안반영폐기가 그렇고,
+            #    **비법률안이 특히 그렇다**: 임명동의안·임명승인안·사직의 건·국정감사
+            #    결과보고서 채택의 건은 '원안가결' 인데 표결 집계가 아예 없다(이의없음으로
+            #    처리된다). 실측 163건이 전부 그 부류였다.
+            #    그걸 실패로 적으면 고칠 수 없는 빨간불이 쌓이고, 그러면 사람이 원장
+            #    전체를 안 믿는다. 판정 대상은 **법률안이면서 표결에 부쳐진 것**뿐이다.
+            if (vs.get("yes") is None and f.get("billKindCd") == "법률안"
+                    and js.get("procResultName") in ("원안가결", "수정가결", "부결")):
+                sub_fail("bill_vote", "parse:표결 요약 숫자가 없다")
         except Exception as e:
-            dbm.record_failure(db, "bill_vote", bill_no, detail=f"parse:{type(e).__name__}")
-    if f.get("billKindCd") == "법률안" and d["represent"]:
+            sub_fail("bill_vote", f"parse:{type(e).__name__}")
+    if js.get("proposerKindCd") == "의원":
         try:
-            proposers = parse_proposers(
-                session.xhr(PROPOSER, {"billId": bill_id, "billNo": bill_no,
-                                       "_csrf": session.likms_csrf()},
-                            referer=net.LIKMS_SEARCH_PAGE).text, d["represent"])
+            proposers, declared = fetch_proposers(session, bill_id, bill_no)
+            # 상세 카드의 대표발의자가 팝업이 선언한 대표 명단 밖이면 둘 중 하나가 틀린 것이다.
+            # 데이터는 넣되(공동발의로라도 남는 편이 낫다) 흔적을 남긴다.
+            if d["represent"] and not any(
+                    p["open_na_id"] == d["represent"] and p["role"] == "대표발의"
+                    for p in proposers):
+                sub_fail("bill_proposer", f"parse:대표발의 불일치 (카드 {d['represent']})")
         except Exception as e:
-            dbm.record_failure(db, "bill_proposer", bill_no, detail=f"parse:{type(e).__name__}")
+            sub_fail("bill_proposer", f"parse:{type(e).__name__}")
+    # 대안 관계는 결말이 그것을 시사하는 의안에만 붙인다(약 5,300건). 전량에 붙이면
+    # 2만 요청이 늘고 대부분은 빈 표다.
+    if (js.get("procResultName") in ("대안반영폐기", "본회의불부의")
+            or js.get("proposerKindCd") == "위원장"):
+        try:
+            alt_no, absorbed = parse_alternatives(
+                session.xhr(ANBILL, {**f, "_csrf": session.likms_csrf()},
+                            referer=net.LIKMS_SEARCH_PAGE).text)
+            if alt_no:
+                # 한 요청이 형제 전부의 관계를 준다 — 자기 것만 담고 버리면 그 정보를 잃는다.
+                alt_edges = [{"bill_no": o, "alt_bill_no": alt_no}
+                             for o in dict.fromkeys([*absorbed, bill_no]) if o != alt_no]
+        except Exception as e:
+            sub_fail("bill_alt", f"parse:{type(e).__name__}")
 
-    db.execute("BEGIN")
+    # ⚠️ **BEGIN 이 아니라 BEGIN IMMEDIATE 다.** 이 트랜잭션은 읽기로 시작해서(아래
+    #    review_status 조회) 쓰기로 넘어가는데, 기본 DEFERRED 는 그 승격 시점에
+    #    busy_timeout 을 **기다리지 않고 곧바로** SQLITE_BUSY 를 낸다 — 승격은 교착이
+    #    될 수 있어 SQLite 가 대기를 거부한다. 6워커에서 실측 40건 중 3건이 그렇게
+    #    'database is locked' 로 죽었다. IMMEDIATE 는 쓰기 락을 처음부터 잡아
+    #    busy_timeout(30초)이 정상적으로 듣는다.
+    db.execute("BEGIN IMMEDIATE")
     try:
+        # ⚠️ **outcome 은 여기 한 곳에서만 계산한다.** 목록 UPSERT 가 같이 건드리면
+        #    감사의 outcome_mismatch 가 "저장값 ≠ 재계산값"이라는 뜻을 잃는다.
+        cur = db.execute("SELECT review_status, decision_result FROM bills WHERE bill_no = ?",
+                         (bill_no,)).fetchone()
+        extra["outcome"] = dbm.derive_outcome(
+            cur["review_status"] if cur else None,
+            cur["decision_result"] if cur else None,
+            extra.get("reconsideration_result"))
+        # ⚠️ **위원회를 먼저 등록하고 그 반환값을 넣는다.** 원천 표기를 그대로 UPDATE 하면
+        #    committees 에 없는 이름이라 FK 위반으로 의안 하나가 통째로 롤백된다.
+        if extra.get("current_committee"):
+            extra["current_committee"] = dbm.upsert_committee(db, extra["current_committee"])
         sets = ", ".join(f"{k} = ?" for k in extra)
         db.execute(f"UPDATE bills SET {sets} WHERE bill_no = ?", [*extra.values(), bill_no])
         for st in stages:
@@ -421,18 +666,24 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
                     db, st["committee_name"],
                     committee_class="소위원회" if st["stage"] == "소위" else None,
                     parent=st.get("parent"))
-            db.execute("""INSERT INTO bill_stages (bill_no, stage, seq, committee_name,
-                              date_referred, date_presented, date_processed, result, ref_no, doc_url)
-                          VALUES (?,?,?,?,?,?,?,?,?,?)
-                          ON CONFLICT(bill_no, stage, seq) DO UPDATE SET
-                              committee_name=excluded.committee_name,
-                              date_referred=excluded.date_referred,
-                              date_presented=excluded.date_presented,
-                              date_processed=excluded.date_processed,
-                              result=excluded.result, ref_no=excluded.ref_no""",
-                       (bill_no, st["stage"], st["seq"], st["committee_name"],
-                        st["date_referred"], st["date_presented"], st["date_processed"],
-                        st["result"], st["ref_no"], st["doc_url"]))
+            st.pop("parent", None)
+        # ⚠️ UPSERT 가 아니라 DELETE+INSERT 다. 소위 절반이 committee_name 이 비어 정렬
+        #    타이가 생기고, 타이가 뒤집히면 UPSERT 는 덮어쓰기 대신 삽입으로 동작해
+        #    에러 없이 행만 는다. 이 트랜잭션이 통째로 롤백되므로 지우고 넣어도 안전하다.
+        dbm.replace_children_txn(db, "bill_stages", "bill_no", bill_no,
+                                 [{"bill_no": bill_no, **st} for st in stages])
+        dbm.replace_children_txn(db, "bill_promulgated_laws", "bill_no", bill_no,
+                                 [{"bill_no": bill_no, **lw} for lw in laws])
+        if alt_edges:
+            # 형제들의 행까지 같이 만든다. 자기 것만 담으면 역방향 질의가 반만 답한다.
+            # ⚠️ **우리가 모르는 의안은 건너뛴다.** 형제 중 하나가 bills 에 없으면 FK 위반이
+            #    나고, 그러면 그 의안의 상세가 통째로 롤백된다 — 남의 행 하나 때문에
+            #    내 데이터를 잃는 구조가 된다. 목록을 먼저 받으므로 정상 경로에서는 다 있다.
+            db.executemany(
+                "INSERT INTO bill_alternatives (bill_no, alt_bill_no) "
+                "SELECT ?, ? WHERE EXISTS (SELECT 1 FROM bills WHERE bill_no = ?) "
+                "ON CONFLICT(bill_no, alt_bill_no) DO NOTHING",
+                [(e["bill_no"], e["alt_bill_no"], e["bill_no"]) for e in alt_edges])
         for mt in meetings:
             db.execute("""INSERT INTO bill_meetings VALUES (?,?,?,?,?,?)
                           ON CONFLICT(bill_no, conference_id) DO UPDATE SET
@@ -443,26 +694,59 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
             for p in proposers:
                 dbm.upsert_member(db, p["open_na_id"], name=p["name"],
                                   name_hanja=p["name_hanja"], party=p["party"])
+            # ⚠️ **expected 는 원천이 선언한 총원이다. len(proposers) 가 아니다.**
+            #    자기 자신의 길이를 기대값으로 주면 언제나 참이라 검사가 아니고,
+            #    v1 에서 발의자 34,270명이 사라진 방식이 정확히 그것이다.
             dbm.replace_children(db, "bill_proposers", "bill_no", bill_no,
                                  [{"bill_no": bill_no, "open_na_id": p["open_na_id"],
                                    "role": p["role"]} for p in proposers],
-                                 expected=len(proposers))
+                                 expected=declared or None)
         # ⚠️ 본회의 단계가 있어도 표결이 없는 의안이 있다(대안반영폐기 등).
         #    그때 요약 행을 만들면 숫자가 전부 NULL인 유령 행이 남아 "표결이 있다"는
         #    조인이 그 의안을 잡는다. 실제 표결 숫자가 온 경우에만 쓴다.
         if votes and votes[0].get("yes") is not None:
             vs, vlist = votes
+            # result 를 리터럴 None 으로 두면 이 컬럼이 영원히 빈다 — 표결 결과를 묻는
+            # 질의가 bills 를 다시 조인하게 되고, 그러면 이 표를 둘 이유가 없어진다.
+            # JSON 의 procResultName 이 그 값이다('원안가결'·'수정가결'·'부결').
             db.execute("""INSERT INTO bill_vote_summary VALUES (?,?,?,?,?,?,?,?,?)
                           ON CONFLICT(bill_no) DO UPDATE SET
+                              date_voted=excluded.date_voted, total_seats=excluded.total_seats,
                               present=excluded.present, yes=excluded.yes, no=excluded.no,
-                              abstain=excluded.abstain""",
+                              abstain=excluded.abstain, result=excluded.result""",
                        (bill_no, vs.get("date_voted"), vs.get("total_seats"), vs.get("present"),
-                        vs.get("yes"), vs.get("no"), vs.get("abstain"), None, dbm.now_str()))
+                        vs.get("yes"), vs.get("no"), vs.get("abstain"),
+                        dbm.norm_text(js.get("procResultName")), dbm.now_str()))
+            # slug 없는 표를 **이름으로 회수한다.** 링크가 없을 뿐 이름은 적혀 있다.
+            # ⚠️ 동명이인은 회수하지 않는다 — 22대에 박지원이 둘이다(PARKJIEWON /
+            #    PARKJIWON). 이름만으로 고르면 반은 남의 표가 되고, 표결 기록에서
+            #    그건 조용한 오답 중 최악이다. 못 고른 것은 세어서 기대값에서 뺀다.
+            unresolved = 0
+            for u in vote_unlinked:
+                cand = [r[0] for r in db.execute(
+                    "SELECT open_na_id FROM members WHERE name = ?", (u["name"],))]
+                if len(cand) == 1:
+                    vlist.append({"open_na_id": cand[0], "vote": u["vote"]})
+                else:
+                    unresolved += 1
+            vlist = list({v["open_na_id"]: v for v in vlist}.values())
             for v in vlist:
                 dbm.upsert_member(db, v["open_na_id"])
+            # ⚠️ 여기도 len(vlist) 를 쓰면 안 된다 — 발의자와 **똑같은 자기 자신 검사**다.
+            #    독립적인 출처는 요약의 찬성+반대+기권이다.
+            expected_votes = sum(vs.get(k) or 0 for k in ("yes", "no", "abstain")) - unresolved
             dbm.replace_children(db, "bill_votes", "bill_no", bill_no,
                                  [{"bill_no": bill_no, **v} for v in vlist],
-                                 expected=len(vlist))
+                                 expected=expected_votes or None)
+            if unresolved:
+                # ⚠️ **kind='gone' 이다. 'retriable' 이 아니다.** 원천이 그 표에 slug 를
+                #    안 주고 이름은 동명이인이라, 다시 받아도 영원히 안 풀린다. retriable 로
+                #    두면 unresolved_retriable 게이트가 상한(5회)을 채울 때까지 빨갛고
+                #    그동안 사람이 게이트 표 전체를 안 믿게 된다 — 고칠 수 없는 것을
+                #    "아직 못 고쳤다"로 부르면 안 된다. 규모는 votes_without_slug 가 센다.
+                sub_failed.add("bill_vote")
+                dbm.record_failure(db, "bill_vote", bill_no, kind="gone",
+                                   detail=f"gone:slug 없는 표 {unresolved}건 (동명이인이라 회수 불가)")
         db.execute("UPDATE bills SET detail_collected_at = ? WHERE bill_no = ?",
                    (dbm.now_str(), bill_no))
         db.execute("COMMIT")
@@ -472,8 +756,9 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
         return False
 
     dbm.clear_failure(db, "bill_detail", bill_no)
-    if vote_missing:
-        print(f"    ⚠️ {bill_no}: slug 없는 표 {vote_missing}건 (저장 불가)")
+    for kind in ("bill_vote", "bill_proposer", "bill_alt"):
+        if kind not in sub_failed:
+            dbm.clear_failure(db, kind, bill_no)
     return True
 
 
@@ -547,9 +832,8 @@ def main() -> int:
             print(f"  총 {collect_list(db, s):,}행")
         if a.list_only:
             return 0
-        todo = [(r[0], r[1]) for r in db.execute(
-            "SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
-            "AND (bill_kind = '법률안' OR bill_kind = '미상')")]
+        sql, sql_args = todo_sql()
+        todo = [(r[0], r[1]) for r in db.execute(sql, sql_args)]
     else:
         todo = [(db.execute("SELECT bill_no FROM bills WHERE bill_id=?", (b,)).fetchone()[0], b)
                 if db.execute("SELECT 1 FROM bills WHERE bill_id=?", (b,)).fetchone()

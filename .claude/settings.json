@@ -12,5 +12,19 @@
     "deny": [
       "Bash(git clean:*)"
     ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/selftest-on-parser-edit.sh",
+            "args": []
+          }
+        ]
+      }
+    ]
   }
 }

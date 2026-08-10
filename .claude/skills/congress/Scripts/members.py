@@ -87,20 +87,36 @@ def parse_profile(html: str) -> dict:
                 # ⚠️ dd 에 당선횟수 뒤로 역대 임기 이력이 통째로 이어 붙는다.
                 #    '재선(제19대, 제22대) 2024.05.30 ~ 제22대 국회의원 …'
                 #    앞의 'N선(…)' 만 떼지 않으면 term_count 에 수백 자가 들어간다.
-                m = re.match(r"([가-힣]+선\s*\([^)]*\))", value)
-                out["term_count"] = m.group(1) if m else value.split()[0]
+                # ⚠️ **re.match 가 아니라 re.search 다.** 이 원천의 dd 는 개행·탭으로
+                #    시작해서 맨 앞 매칭이 매번 실패한다 — 그러면 else 로 떨어져
+                #    value.split()[0] 이 들어가고, 실측으로 의원 162명의 당선횟수가
+                #    '재선(제19대,' 처럼 잘렸다. 숫자 표기('3선')도 있어 [가-힣0-9] 다.
+                m = re.search(r"([가-힣0-9]+선\s*\([^)]*\))", value)
+                out["term_count"] = dbm.norm_text(m.group(1) if m else value.split()[0])
             else:
                 out.setdefault(DT_MAP[label], value)
 
     # 정당·선거구는 전직 페이지에 <dt> 라벨 없이 요약 한 줄로만 온다
     # ('제22대 더불어민주당 부산 북구갑'). 현직도 같은 문자열이 info-set 에 있다.
-    text = tree.body.text(separator=" ") if tree.body else ""
+    # ⚠️ strip=True 를 빼면 안 된다. 이 원천은 값 주위에 공백을 대량으로 넣어서,
+    #    아래 정규식이 공백 덩어리를 값으로 집는다 — 실측에서 조국 의원의 district 가
+    #    181자짜리 공백이 됐다.
+    text = tree.body.text(separator=" ", strip=True) if tree.body else ""
+    # ⚠️ **catch-all 대안(`[가-힣]{2,10}당`)을 넣지 마라.** 정규식 대안은 문자열의 더
+    #    앞에서 맞는 것이 이기므로, 정당명을 앞에 나열해도 안 막힌다 — '국회의사당'이
+    #    페이지 위쪽에 있어서 의원 5명의 party 가 '의사당' 이 됐다. 새 정당이 생기면
+    #    여기 이름을 더한다. 못 맞히면 NULL 이고, NULL 은 감사의 members_missing_party 가 센다.
     if m := re.search(r"(더불어민주당|국민의힘|조국혁신당|개혁신당|진보당|기본소득당|"
-                      r"사회민주당|무소속|[가-힣]{2,10}당)", text):
+                      r"사회민주당|무소속)", text):
         out.setdefault("party", m.group(1))
     if "district" not in out:
         if m := re.search(r"제\d+대\s+\S+당\s+(\S+(?:\s+\S+)?)", text):
-            out["district"] = m.group(1)
+            out["district"] = dbm.norm_text(m.group(1))
+    # ⚠️ 비례대표는 지역구가 **없는** 것이지 '비례대표'라는 이름의 지역구가 아니다.
+    #    그대로 두면 GROUP BY district 에 전국구 버킷이 하나 생기고, "이 지역 의원"
+    #    질의가 비례대표를 지역구 의원처럼 센다. elect_kind 가 이미 그 사실을 담는다.
+    if out.get("district") == "비례대표":
+        out["district"] = None
     return out
 
 
@@ -133,9 +149,20 @@ def enrich(db, session: net.Session, slug: str, **hints) -> bool:
 
     committees = p.pop("committees", [])
     dbm.upsert_member(db, slug, **p)
-    for c in committees:
-        c = dbm.upsert_committee(db, c)           # 참조되는 쪽 먼저. 돌려받은 표기를 쓴다
-        db.execute("INSERT OR IGNORE INTO member_committees VALUES (?, ?)", (slug, c))
+    # ⚠️ **INSERT OR IGNORE 만 하면 낡은 행이 영원히 쌓인다.** 위원회를 옮긴 의원에게
+    #    옛 위원회가 그대로 남아 "이 위원회 소속 의원"이 실제보다 많아지고, 늘어난 쪽은
+    #    에러가 아니라 그럴듯한 답이라 아무도 못 알아챈다. 소속은 **현재 상태**라
+    #    통째로 갈아 끼운다. 상세를 받은 뒤라 목록이 비어 있으면 실제로 비어 있는 것이다.
+    db.execute("BEGIN IMMEDIATE")          # 읽고 쓰는 트랜잭션은 승격 대신 처음부터 잡는다
+    try:
+        names = [dbm.upsert_committee(db, c) for c in committees]   # 참조되는 쪽 먼저
+        dbm.replace_children_txn(db, "member_committees", "open_na_id", slug,
+                                 [{"open_na_id": slug, "committee_name": n} for n in
+                                  dict.fromkeys(names)])
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
     dbm.clear_failure(db, "member", slug)
     return True
 

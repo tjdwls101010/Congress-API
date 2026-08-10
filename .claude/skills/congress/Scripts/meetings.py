@@ -174,8 +174,12 @@ def parse_body(html: str) -> tuple[list[dict], list[dict], list[dict]]:
                                  "display_name": name, "position": pos})
         # 여러 문단이 <br>로 이어진다. 개행으로 붙여 원문 구조를 남긴다.
         paras = [s.text(strip=True) for s in blk.css("span.spk_sub")]
-        text = "\n".join(p for p in paras if p) or blk.css_first(".talk").text(
-            separator="\n", strip=True) if blk.css_first(".talk") else ""
+        # ⚠️ **괄호가 없으면 안 된다. 삼항연산자가 `or` 보다 우선순위가 낮다.**
+        #    괄호 없이 쓰면 `(A or B) if C else ""` 로 묶여서, .talk 이 없는 블록의
+        #    발언이 spk_sub 에 멀쩡히 있는데도 통째로 "" 가 된다.
+        text = ("\n".join(p for p in paras if p)
+                or (blk.css_first(".talk").text(separator="\n", strip=True)
+                    if blk.css_first(".talk") else ""))
         utterances.append({"seq": seq, "speaker_no": speakers[key], "text": text})
 
     agenda = []
@@ -215,7 +219,15 @@ def fetch_body(session: net.Session, conference_id: int, tries: int = 4) -> str:
         r.raise_for_status()
         last = r.text
         found = set(SELF_ID_RE.findall(last))
-        id_ok = str(conference_id) in found or not found
+        # ⚠️ **`not found` 를 통과로 두면 이 가드가 통째로 무력해진다.** 2026-08-10 실측:
+        #    원천이 본문에서 pdf/xml 링크를 **빼 버렸고**, 그래서 전 회의가 `found=set()`
+        #    으로 떨어져 무조건 통과했다. 그 상태로 받은 2,047건 중 **28건이 다른 회의의
+        #    본문**이었다 — v1 의 52315 내용이 v2 의 52526 자리에 들어갔다.
+        #    문서가 자기를 안 밝히면 그건 "괜찮다"가 아니라 **"확인할 수 없다"** 이고,
+        #    확인할 수 없는 것을 확인된 것처럼 저장하는 것이 이 프로젝트에서 가장 위험하다.
+        #    막지는 않는다 — 지금 원천이 **전부** 그렇게 주므로 막으면 회의록이 통째로
+        #    안 들어온다. 대신 collect_one 이 원장에 남겨 눈에 보이게 한다.
+        id_ok = str(conference_id) in found if found else True
         # ⚠️ 메타 줄이 없는 응답도 온다. h2 · .tit 이 **둘 다 빈** 문서가 실재하고,
         #    그러면 형식이 다른 .minutes_header 로 떨어져 파싱이 깨진다(실측 8건).
         #    이것도 플래핑이라 다시 받으면 대개 들어 있다 — 그래서 "쓸 만한 문서인가"를
@@ -243,6 +255,7 @@ def collect_one(db, session: net.Session, conference_id: int, committee_class: s
     except Exception as e:
         dbm.record_failure(db, "meeting_body", conference_id, detail=f"network:{type(e).__name__}")
         return False
+
 
     try:
         meta = parse_meta(html)
@@ -282,7 +295,8 @@ def collect_one(db, session: net.Session, conference_id: int, committee_class: s
                           date_meeting, pdf_url, collected_at)
                       VALUES (?,?,?,?,?,?,?,?,?,?,?)
                       ON CONFLICT(conference_id) DO UPDATE SET
-                          session_no=excluded.session_no, sitting_no=excluded.sitting_no,
+                          session_no=excluded.session_no, session_kind=excluded.session_kind,
+                          sitting_no=excluded.sitting_no,
                           committee_name=excluded.committee_name,
                           committee_class=excluded.committee_class,
                           is_subcommittee=excluded.is_subcommittee,
