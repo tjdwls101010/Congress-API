@@ -982,10 +982,19 @@ def upsert_bill_list(db: sqlite3.Connection, row: dict) -> None:
     now = now_str()
     names = ["bill_no", *cols, "collected_at", "updated_at"]
     vals = [row["bill_no"], *cols.values(), now, now]
-    sets = ", ".join(f"{c} = excluded.{c}" for c in cols if c not in BILL_LIST_INSERT_ONLY)
+    upd = [c for c in cols if c not in BILL_LIST_INSERT_ONLY]
+    sets = ", ".join(f"{c} = excluded.{c}" for c in upd)
+    # ⚠️ **값이 실제로 바뀔 때만 updated_at 을 민다.** 매 실행의 목록 패스가 무조건
+    #    밀면 updated_at 은 "마지막으로 목록을 본 시각"이 되고, 그러면
+    #    `updated_at > detail_collected_at` 이 **전 행에서 참**이 되어 stale_details 가
+    #    전량을 재수집 대상으로 부른다 — 갱신 설계가 통째로 무의미해진다.
+    # ⚠️ `<>` 가 아니라 `IS NOT` 이다. NULL <> 'x' 는 참이 아니라 NULL 이라,
+    #    `<>` 로 쓰면 NULL 이 값으로 바뀌는 흔한 변화를 통째로 놓친다.
+    where = " OR ".join(f"bills.{c} IS NOT excluded.{c}" for c in upd)
     db.execute(
         f"""INSERT INTO bills ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})
-            ON CONFLICT(bill_no) DO UPDATE SET {sets}, updated_at = excluded.updated_at""",
+            ON CONFLICT(bill_no) DO UPDATE SET {sets}, updated_at = excluded.updated_at
+            {f'WHERE {where}' if where else ''}""",
         vals)
 
 
@@ -1266,6 +1275,28 @@ def selftest(db_path: str) -> int:
     check("bills 행이 늘지 않았다",
           db.execute("SELECT COUNT(*) FROM bills").fetchone()[0] == 1)
 
+    # ── updated_at 은 **값이 진짜 바뀔 때만** 밀린다.
+    # ⚠️ 이게 깨지면 stale_details 게이트가 전량을 재수집 대상으로 부르고, 그러면
+    #    매 실행이 2만 건을 다시 받으면서도 "갱신이 도는 중"으로 보인다.
+    db.execute("UPDATE bills SET updated_at = '2000-01-01 00:00:00' WHERE bill_no='2214631'")
+    same = {"bill_no": "2214631", "bill_id": "PRC_A", "assembly_unit": 22, "bill_kind": "미상",
+            "title": "소프트웨어 진흥법 일부개정법률안", "review_status": "본회의 통과"}
+    upsert_bill_list(db, same)
+    check("값이 그대로면 updated_at 이 안 밀린다",
+          db.execute("SELECT updated_at FROM bills WHERE bill_no='2214631'").fetchone()[0]
+          == "2000-01-01 00:00:00")
+    upsert_bill_list(db, {**same, "review_status": "공포"})
+    check("값이 바뀌면 updated_at 이 밀린다",
+          db.execute("SELECT updated_at FROM bills WHERE bill_no='2214631'").fetchone()[0]
+          != "2000-01-01 00:00:00")
+    # NULL → 값 은 `<>` 로는 안 잡히는 변화다. IS NOT 을 쓰는 이유가 이것이다.
+    db.execute("UPDATE bills SET updated_at='2000-01-01 00:00:00', date_decided=NULL "
+               "WHERE bill_no='2214631'")
+    upsert_bill_list(db, {**same, "review_status": "공포", "date_decided": "2026-01-01"})
+    check("NULL 에서 값으로 바뀐 것도 잡는다",
+          db.execute("SELECT updated_at FROM bills WHERE bill_no='2214631'").fetchone()[0]
+          != "2000-01-01 00:00:00")
+
     # ── bill_stages: DELETE+INSERT 라 정렬 타이가 뒤집혀도 행이 안 는다
     #
     # ⚠️ 이게 UPSERT 였을 때의 사고를 재현한다. 소위는 절반이 committee_name 이 비어
@@ -1314,6 +1345,25 @@ def selftest(db_path: str) -> int:
             ("국회가 내년에 만들 새 상태", None, None, "계류")):
         got = derive_outcome(rs, dr, rr)
         check(f"outcome({rs!r},{dr!r},{rr!r}) = {want}", got == want, got)
+    # ⚠️ audit.py 의 outcome_mismatch 는 이 함수를 **SQL CASE 로 옮겨 적은 것**이다.
+    #    둘이 갈리면 그 게이트가 조용히 거짓말을 하므로 값 행렬 전체로 대조한다.
+    _cases = [(rs, dr, rr)
+              for rs in (None, "공포", "대안반영폐기", "수정안반영폐기", "본회의불부의",
+                         "철회", "폐기", "재의(부결)", "소관위심사", "정부이송")
+              for dr in (None, "원안가결", "수정가결", "부결", "대안반영폐기", "철회")
+              for rr in (None, "부결", "가결")]
+    _sql = """SELECT CASE
+                WHEN :rr='부결' OR :rs='재의(부결)' THEN '재의부결'
+                WHEN :rs='공포' THEN '공포'
+                WHEN :rs IN ('대안반영폐기','수정안반영폐기','본회의불부의','철회','폐기') THEN :rs
+                WHEN :dr='부결' THEN '부결'
+                WHEN :dr IN ('대안반영폐기','수정안반영폐기','본회의불부의','철회','폐기') THEN :dr
+                ELSE '계류' END"""
+    _bad = [(rs, dr, rr, derive_outcome(rs, dr, rr),
+             db.execute(_sql, {"rs": rs, "dr": dr, "rr": rr}).fetchone()[0])
+            for rs, dr, rr in _cases]
+    _bad = [x for x in _bad if x[3] != x[4]]
+    check(f"SQL 판정이 파이썬과 {len(_cases)}가지 조합에서 일치한다", not _bad, str(_bad[:3]))
     check("유도 결과가 전부 CHECK 안의 값이다",
           all(derive_outcome(rs, dr, rr) in OUTCOME_VALUES
               for rs in (None, "공포", "철회", "소관위심사", "재의(부결)")

@@ -46,11 +46,54 @@ GATES: dict[str, tuple[str, str]] = {
                    WHERE assembly_unit=22 AND bill_no GLOB '{NUM7}')
         -- COALESCE 가 없으면 빈 테이블에서 0 이 아니라 NULL 이 나와 판정이 무너진다
         SELECT COALESCE((SELECT MAX(no)-MIN(no)+1 FROM n),0) - (SELECT COUNT(*) FROM n)"""),
-    "bill_detail_missing": ("법률안 중 상세 미수집이 없다 (실패 원장 제외)", """
+    "bill_detail_missing": ("상세 수집 대상 중 미수집이 없다 (원장에 걸린 것 제외)", f"""
+        -- ⚠️ **'미상'을 빼면 이 게이트는 아무것도 검사하지 않는다.** 의안종류는 상세에서만
+        --    오므로 상세를 못 받은 의안은 영원히 '미상'이다 — 즉 이 게이트가 놓쳐야 할
+        --    바로 그 집합이 조건 밖으로 나간다. 실측으로 20,598건 전부가 '미상'인 채
+        --    이 게이트는 초록불이었다. 수집 대상 조건은 bills.todo_sql 과 같아야 한다.
         SELECT COUNT(*) FROM bills b
-        WHERE b.bill_kind='법률안' AND b.detail_collected_at IS NULL
+        WHERE (b.bill_kind='법률안' OR b.bill_kind='미상') AND b.detail_collected_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM collect_failures f
-                          WHERE f.target_kind='bill_detail' AND f.target_key=b.bill_no)"""),
+                          WHERE f.target_kind='bill_detail' AND f.target_key=b.bill_no
+                            AND (f.kind='gone' OR f.attempts >= {dbm.MAX_ATTEMPTS}))"""),
+    "outcome_mismatch": ("저장된 outcome 이 재계산값과 같다", """
+        -- ⚠️ 이 CASE 는 db.derive_outcome 을 그대로 옮긴 것이고 **순서가 곧 우선순위다.**
+        --    둘이 갈리면 이 게이트가 의미를 잃으므로 selftest 가 둘을 대조한다.
+        SELECT COUNT(*) FROM bills WHERE detail_collected_at IS NOT NULL AND outcome <> (
+            CASE
+              WHEN reconsideration_result='부결' OR review_status='재의(부결)' THEN '재의부결'
+              WHEN review_status='공포' THEN '공포'
+              WHEN review_status IN ('대안반영폐기','수정안반영폐기','본회의불부의','철회','폐기')
+                   THEN review_status
+              WHEN decision_result='부결' THEN '부결'
+              WHEN decision_result IN ('대안반영폐기','수정안반영폐기','본회의불부의','철회','폐기')
+                   THEN decision_result
+              ELSE '계류' END)"""),
+    "proposer_count_mismatch": ("발의자 수가 원천이 선언한 총원과 같다", """
+        -- 원천은 '이해민의원 등 12인' 으로 총원을 스스로 말한다. 저장된 행 수가 그와 다르면
+        -- 페이징이 새거나 파서가 일부만 읽은 것이다 — v1 에서 34,270명이 그렇게 사라졌다.
+        SELECT COUNT(*) FROM bills b
+        WHERE b.detail_collected_at IS NOT NULL AND b.proposer_kind='의원'
+          AND b.proposer_summary LIKE '%등 %인'
+          AND CAST(replace(substr(b.proposer_summary,
+                                  instr(b.proposer_summary,'등 ')+2), '인','') AS INTEGER)
+              <> (SELECT COUNT(*) FROM bill_proposers p WHERE p.bill_no=b.bill_no)"""),
+    "vote_sum_mismatch": ("표결 요약 숫자와 저장된 표 수가 같다 (회수 불가분 제외)", """
+        SELECT COUNT(*) FROM bill_vote_summary s
+        WHERE s.yes IS NOT NULL
+          AND s.yes+s.no+s.abstain
+              <> (SELECT COUNT(*) FROM bill_votes v WHERE v.bill_no=s.bill_no)
+          -- 이름이 있는데 slug 가 없고 동명이인이라 회수 못 한 표는 원장에 남긴다.
+          AND NOT EXISTS (SELECT 1 FROM collect_failures f
+                          WHERE f.target_kind='bill_vote' AND f.target_key=s.bill_no)"""),
+    "stale_details": ("목록이 바뀐 뒤 상세를 다시 받지 않은 의안이 없다", f"""
+        -- 이게 없으면 계류 의안의 심사단계가 영원히 낡는다 — 갱신이 작동하는지를
+        -- 실제로 재는 유일한 자리다. updated_at 은 값이 진짜 바뀔 때만 밀린다.
+        SELECT COUNT(*) FROM bills b
+        WHERE b.detail_collected_at IS NOT NULL AND b.updated_at > b.detail_collected_at
+          AND NOT EXISTS (SELECT 1 FROM collect_failures f
+                          WHERE f.target_kind='bill_detail' AND f.target_key=b.bill_no
+                            AND (f.kind='gone' OR f.attempts >= {dbm.MAX_ATTEMPTS}))"""),
     "meeting_bodies_missing": ("수집 범위 회의 중 본문 미수집이 없다", """
         SELECT COUNT(*) FROM meetings m
         WHERE NOT EXISTS (SELECT 1 FROM meeting_utterances u WHERE u.conference_id=m.conference_id)
@@ -78,12 +121,17 @@ GATES: dict[str, tuple[str, str]] = {
                    OR reason_text LIKE '%찾을 수 없습니다%'
                    OR title LIKE '%계류의안%' OR title LIKE '%처리의안%')
              + (SELECT COUNT(*) FROM bill_stages
-                WHERE result LIKE '%<%>%' OR ref_no LIKE '%공포번호%'
-                   OR date_processed LIKE '%일자%')
+                WHERE result LIKE '%<%>%' OR date_processed LIKE '%일자%')
+             + (SELECT COUNT(*) FROM bill_promulgated_laws WHERE law_no LIKE '%공포번호%')
              + (SELECT COUNT(*) FROM bill_meetings WHERE meeting_name LIKE '%회의결과%')"""),
-    "unresolved_retriable": ("상한 미달의 재시도 대상이 없다", f"""
+    "unresolved_retriable": ("지난 실행이 남긴 재시도 대상이 없다", f"""
+        -- ⚠️ **이번 실행에서 새로 난 실패는 세지 않는다.** 2만 건을 받는 동안 일시적
+        --    오류 하나만 나도 종료코드 1이 되면 "게이트 전부 pass" 를 원리적으로 채울 수
+        --    없고, 그러면 사람이 이 표 전체를 안 믿게 된다. 다음 실행이 회수할 것을
+        --    지금 실패로 부를 이유가 없다 — 지난 실행 것이 남아 있는 것이 진짜 신호다.
         SELECT COUNT(*) FROM collect_failures
-        WHERE kind='retriable' AND attempts < {dbm.MAX_ATTEMPTS}"""),
+        WHERE kind='retriable' AND attempts < {dbm.MAX_ATTEMPTS}
+          AND (:since IS NULL OR last_attempt_at < :since)"""),
 }
 
 #: 보고값 — 등식이 아니다. 값과 추이를 본다.
@@ -108,17 +156,33 @@ REPORTS: dict[str, tuple[str, str]] = {
                   AND NOT EXISTS (SELECT 1 FROM meetings p
                                   WHERE p.committee_name=m.committee_name
                                     AND p.sitting_no=m.sitting_no-1))"""),
-    "promulgated_without_number": ("공포 단계인데 공포번호가 빈 의안. **원천이 비워 둔다** — 추이를 본다", """
-        SELECT COUNT(*) FROM bill_stages s
-        WHERE s.stage='공포' AND (s.ref_no IS NULL OR s.ref_no='')"""),
-    "dangling_alt_bills": ("alt_bill_id 가 가리키는 의안이 목록에 없는 건수. **원천이 의안 아닌 문서를 가리킨다**", """
+    "promulgated_without_number": ("공포법률인데 공포번호가 빈 것. **원천이 비워 둔다** — 추이를 본다", """
+        SELECT COUNT(*) FROM bill_promulgated_laws WHERE law_no IS NULL OR law_no=''"""),
+    "dangling_ref_bills": ("ref_bill_id 가 가리키는 의안이 목록에 없는 건수. **원천이 의안 아닌 문서를 가리킨다**", """
         -- 실측 4,397개 링크 중 241개(5.5%)가 안 풀린다. 그 대상들의 billNo 는
         -- 'DD20811' 처럼 의안번호가 아니다 — 번호가 붙기 전의 위원회 대안 초안이라
-        -- 원천의 의안검색(20,598건)에도 안 나온다. 우리 목록이 빠뜨린 것이 아니다:
+        -- 원천의 의안검색에도 안 나온다. 우리 목록이 빠뜨린 것이 아니다:
         -- bill_no_gaps=0 이 번호 있는 의안의 완결성을 이미 증명한다.
-        -- 값이 크게 튀면 그때가 신호다.
-        SELECT COUNT(*) FROM bills b WHERE b.alt_bill_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM bills t WHERE t.bill_id=b.alt_bill_id)"""),
+        -- 확실한 대안 관계는 bill_alternatives 가 담으므로 이건 추이만 본다.
+        SELECT COUNT(*) FROM bills b WHERE b.ref_bill_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM bills t WHERE t.bill_id=b.ref_bill_id)"""),
+    "exhausted_retriable": ("상한을 넘겨 포기한 대상. **게이트가 아니다** — 값이 늘면 파서를 봐라", f"""
+        SELECT COUNT(*) FROM collect_failures
+        WHERE kind='retriable' AND attempts >= {dbm.MAX_ATTEMPTS}"""),
+    "outcome_dist": ("outcome 분포. 눈으로 본다", """
+        SELECT group_concat(o, ' · ') FROM (
+            SELECT outcome || '=' || COUNT(*) o FROM bills WHERE bill_kind='법률안'
+            GROUP BY outcome ORDER BY COUNT(*) DESC)"""),
+    "review_status_values": ("원천의 심사진행상태 값 집합. **새 값이 나오면 outcome 규칙을 봐라**", """
+        -- 모르는 상태는 조용히 '계류'로 떨어진다. 그 조용함을 깨는 것이 이 항목이다.
+        SELECT group_concat(v, ' · ') FROM (
+            SELECT DISTINCT review_status v FROM bills WHERE review_status IS NOT NULL
+            ORDER BY v)"""),
+    "alternatives_total": ("대안 관계 수 (실측 기준 4,156 이상)",
+                           "SELECT COUNT(*) FROM bill_alternatives"),
+    "current_committee_missing": ("현재 소관위가 빈 상세 수집분. 0에 가까워야 한다", """
+        SELECT COUNT(*) FROM bills
+        WHERE detail_collected_at IS NOT NULL AND current_committee IS NULL"""),
     "bill_no_min": ("의안번호 하한 (기대 2200001)",
                     f"SELECT MIN(CAST(bill_no AS INTEGER)) FROM bills "
                     f"WHERE assembly_unit=22 AND bill_no GLOB '{NUM7}'"),
@@ -143,13 +207,18 @@ REPORTS: dict[str, tuple[str, str]] = {
 }
 
 
-def run(db, seed_exists: bool) -> dict:
+def run(db, seed_exists: bool, since: str | None = None) -> dict:
+    """``since`` 는 **이번 실행이 시작한 시각**이다. 그 뒤에 난 실패는 게이트로 세지 않는다.
+
+    None 이면 전부 센다 — 수집과 무관하게 지금 상태를 보는 ``--audit-only`` 의 기본값이다.
+    """
+    p = {"since": since}
     out: dict[str, dict] = {}
     for key, (desc, sql) in GATES.items():
-        v = db.execute(sql).fetchone()[0]
+        v = db.execute(sql, p).fetchone()[0]
         out[key] = {"value": v, "status": "pass" if v == 0 else "fail", "desc": desc}
     for key, (desc, sql) in REPORTS.items():
-        out[key] = {"value": db.execute(sql).fetchone()[0], "status": "report", "desc": desc}
+        out[key] = {"value": db.execute(sql, p).fetchone()[0], "status": "report", "desc": desc}
 
     # ── 조건부: 명부 시드가 있을 때만 판정한다.
     #    시드가 없으면 우변을 만들 방법이 아예 없다(명부 API 403). fail 이 아니라 skip 이다.
@@ -169,11 +238,12 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=str(dbm.DB_PATH))
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--since", help="이 시각 뒤에 난 실패는 게이트로 세지 않는다 (KST 'YYYY-MM-DD HH:MM:SS')")
     a = ap.parse_args()
 
     db = dbm.connect(a.db)
     dbm.init_schema(db)
-    res = run(db, SEED.exists())
+    res = run(db, SEED.exists(), a.since)
     failed = [k for k, v in res.items() if v["status"] == "fail"]
 
     if a.json:
@@ -187,7 +257,12 @@ def main() -> int:
             print(f"\n{status.upper()}")
             for k, v in rows:
                 exp = f" (기대 {v['expected']})" if "expected" in v else ""
-                print(f"  {mark} {k:26s} {str(v['value']):>10s}{exp}   {v['desc']}")
+                val = str(v["value"])
+                # 분포·값 집합처럼 긴 문자열은 자리를 맞추지 않는다 — 맞추면 표가 무너진다.
+                if len(val) > 10:
+                    print(f"  {mark} {k:26s} {v['desc']}\n      {val}")
+                else:
+                    print(f"  {mark} {k:26s} {val:>10s}{exp}   {v['desc']}")
     return 1 if failed else 0
 
 

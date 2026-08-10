@@ -20,6 +20,7 @@ import argparse
 import re
 import sys
 import threading
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -472,20 +473,44 @@ def parse_alternatives(html: str) -> tuple[str | None, list[str]]:
     return alt, absorbed
 
 
-def todo_sql(extra_where: str = "") -> tuple[str, list]:
+#: 계류 의안의 상세를 다시 받는 주기(일). 심사단계는 계류 중에도 계속 움직이므로
+#: 한 번 받고 두면 **14,000건이 영원히 낡는다** — v2 가 존재하는 이유의 절반이 이것이다.
+DEFAULT_REFRESH_DAYS = 30
+
+
+def todo_sql(refresh_days: int = DEFAULT_REFRESH_DAYS) -> tuple[str, list]:
     """상세를 받아야 할 의안. **collect.py 와 공유한다** — 두 곳에 적으면 갈라진다.
 
-    ⚠️ 상한 초과분을 빼는 첫 절이 없으면 **영구 재시도 루프**가 된다. 발의자 수가
-       안 맞을 때 ``detail_collected_at`` 을 안 쓰기로 했으므로, 상한(5회)을 넘겨도
-       ``detail_collected_at IS NULL`` 이 계속 참이라 매 실행이 같은 의안을 다시 받는다.
+    받아야 할 이유가 넷이다:
+
+    1. 아직 안 받았다 (``detail_collected_at IS NULL``)
+    2. 원장에 살아 있는 실패가 붙어 있다 — 없으면 한 번 받은 뒤 실패한 재수집이 영영
+       재시도되지 않고 ``unresolved_retriable`` 이 영구히 빨갛다
+    3. **목록이 그 뒤에 바뀌었다** (``updated_at > detail_collected_at``)
+    4. **계류인데 오래됐다** — 이게 없으면 계류 14,000건의 심사단계가 굳는다
+
+    ⚠️ 상한 초과분을 빼는 마지막 절이 없으면 **영구 재시도 루프**가 된다. 발의자 수가
+       안 맞으면 ``detail_collected_at`` 을 안 쓰므로, 상한(5회)을 넘겨도 1번 조건이
+       계속 참이라 매 실행이 같은 의안을 다시 받는다.
+    ⚠️ 주기 비교를 SQL 의 ``datetime('now','-30 day')`` 로 하지 마라. 그건 **UTC** 인데
+       우리가 저장하는 시각은 ``dbm.now_str()`` 의 **KST** 라 9시간이 어긋난다.
+       경계선의 의안이 하루 일찍/늦게 걸리고, 그 어긋남은 아무 에러도 내지 않는다.
+       그래서 기준 시각을 파이썬에서 KST 로 계산해 넘긴다.
     """
-    sql = ("SELECT bill_no, bill_id FROM bills WHERE detail_collected_at IS NULL "
-           "AND (bill_kind = '법률안' OR bill_kind = '미상') "
-           "AND NOT EXISTS (SELECT 1 FROM collect_failures f "
-           "                WHERE f.target_kind = 'bill_detail' "
-           "                  AND f.target_key = bills.bill_no AND f.attempts >= ?)")
-    args: list = [dbm.MAX_ATTEMPTS]
-    return sql + extra_where, args
+    cutoff = (datetime.now(dbm.KST) - timedelta(days=refresh_days)).strftime("%Y-%m-%d %H:%M:%S")
+    sql = """
+        SELECT bill_no, bill_id FROM bills
+        WHERE (bill_kind = '법률안' OR bill_kind = '미상')
+          AND (detail_collected_at IS NULL
+               OR EXISTS (SELECT 1 FROM collect_failures f
+                          WHERE f.target_kind='bill_detail' AND f.target_key=bills.bill_no
+                            AND f.kind='retriable' AND f.attempts < ?)
+               OR updated_at > detail_collected_at
+               OR (outcome = '계류' AND detail_collected_at < ?))
+          AND NOT EXISTS (SELECT 1 FROM collect_failures f2
+                          WHERE f2.target_kind='bill_detail' AND f2.target_key=bills.bill_no
+                            AND (f2.kind='gone' OR f2.attempts >= ?))"""
+    return sql, [dbm.MAX_ATTEMPTS, cutoff, dbm.MAX_ATTEMPTS]
 
 
 def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool:
@@ -588,7 +613,13 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
         except Exception as e:
             dbm.record_failure(db, "bill_alt", bill_no, detail=f"parse:{type(e).__name__}")
 
-    db.execute("BEGIN")
+    # ⚠️ **BEGIN 이 아니라 BEGIN IMMEDIATE 다.** 이 트랜잭션은 읽기로 시작해서(아래
+    #    review_status 조회) 쓰기로 넘어가는데, 기본 DEFERRED 는 그 승격 시점에
+    #    busy_timeout 을 **기다리지 않고 곧바로** SQLITE_BUSY 를 낸다 — 승격은 교착이
+    #    될 수 있어 SQLite 가 대기를 거부한다. 6워커에서 실측 40건 중 3건이 그렇게
+    #    'database is locked' 로 죽었다. IMMEDIATE 는 쓰기 락을 처음부터 잡아
+    #    busy_timeout(30초)이 정상적으로 듣는다.
+    db.execute("BEGIN IMMEDIATE")
     try:
         # ⚠️ **outcome 은 여기 한 곳에서만 계산한다.** 목록 UPSERT 가 같이 건드리면
         #    감사의 outcome_mismatch 가 "저장값 ≠ 재계산값"이라는 뜻을 잃는다.

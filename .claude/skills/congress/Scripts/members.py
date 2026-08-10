@@ -153,7 +153,7 @@ def enrich(db, session: net.Session, slug: str, **hints) -> bool:
     #    옛 위원회가 그대로 남아 "이 위원회 소속 의원"이 실제보다 많아지고, 늘어난 쪽은
     #    에러가 아니라 그럴듯한 답이라 아무도 못 알아챈다. 소속은 **현재 상태**라
     #    통째로 갈아 끼운다. 상세를 받은 뒤라 목록이 비어 있으면 실제로 비어 있는 것이다.
-    db.execute("BEGIN")
+    db.execute("BEGIN IMMEDIATE")          # 읽고 쓰는 트랜잭션은 승격 대신 처음부터 잡는다
     try:
         names = [dbm.upsert_committee(db, c) for c in committees]   # 참조되는 쪽 먼저
         dbm.replace_children_txn(db, "member_committees", "open_na_id", slug,
