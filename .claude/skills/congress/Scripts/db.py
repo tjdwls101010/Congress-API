@@ -218,18 +218,35 @@ CREATE TABLE IF NOT EXISTS bills (
     review_status   TEXT,                    -- 심사진행상태: '접수'|'위원회심사'|…
                     -- ⚠️ 상시 변한다. 갱신 대상이고, 과거 값은 보존되지 않는다.
 
-    -- ── 여기부터는 상세 페이지에서만 오는 것들. 법률안만 채워진다. ──────────
-    committee_name  TEXT REFERENCES committees(committee_name),   -- 소관위원회
-    proposal_session TEXT,                   -- 제안회기
+    -- ── 여기부터는 상세에서만 오는 것들. 법률안만 채워진다. ──────────
+    -- ⚠️ **아래 다섯은 HTML이 아니라 `findBillDetail.do` JSON에서 온다.** 476바이트에
+    --    현재 소관위·제안일·처리일·처리결과·정부이송일·공포일·발의자 문자열이 다 들어 있다.
+    --    HTML 표에서 유도하지 마라 — 원천이 직접 말해 주는 값을 파싱으로 되만드는 것이고,
+    --    DOM이 바뀌면 깨지는 쪽을 굳이 고르는 셈이다.
+    current_committee TEXT REFERENCES committees(committee_name),
+                    -- JSON `currCmt`. 이 의안이 **지금** 걸려 있는 위원회.
+                    -- ⚠️ 옛 이름 `committee_name`은 **19,985건 전부 NULL이었다** — 상세를 다
+                    --    받고도 채우는 코드가 없었다. 값이 없는 컬럼은 조회하는 쪽에서
+                    --    "이 법안은 위원회가 없구나"로 읽히므로, 빈 채로 두는 것이
+                    --    없는 것보다 나쁘다. JSON이 그걸 고친다.
+    proposal_session INTEGER,                -- 제안회기. '제418회' 같은 문자열이 아니라 정수 418.
+                    -- 문자열로 두면 회기 범위 질의(`BETWEEN 415 AND 420`)가 사전순으로
+                    -- 비교돼 조용히 틀린 답을 준다.
     reason_text     TEXT,                    -- 제안이유 및 주요내용 (평문)
                     -- 키워드 검색의 주 대상. 조문 원문(HWP/PDF)은 수집하지 않는다.
                     -- ⚠️ 이 값이 NULL인 것을 '상세 미수집'의 판정자로 쓰지 마라.
                     --    제안이유가 원래 비어 있는 의안이 있을 수 있고, 그러면 그 의안은
                     --    영원히 미수집으로 잡혀 매 실행이 자기를 다시 받는다.
-    alt_bill_id     TEXT,                    -- selRefBillId. 대안반영폐기 시 내용을 흡수한 법률안.
+    ref_bill_id     TEXT,                    -- 원천 필드명 그대로 `selRefBillId`.
+                    -- ⚠️ **이 컬럼은 두 얼굴이다. 대안 관계로 쓰지 마라.**
+                    --    대안반영폐기·본회의불부의 4,156건에서는 흡수한 대안이 맞지만,
+                    --    나머지 241건(소관위심사 183 · 수정안반영폐기 39 · 공포 8 · 기타 11)은
+                    --    다른 관계이고 대상이 `DD20974` 같은 **임시번호**라 우리 목록에 없다.
+                    --    확실한 대안 관계는 `bill_alternatives`가 담는다 — 그쪽을 조인해라.
+                    -- 이름을 `alt_bill_id`에서 되돌린 이유가 이것이다. `alt_`라고 부르는 순간
+                    --    조회하는 쪽이 전부 대안이라고 읽고, 241건이 조용히 섞인다.
                     -- ⚠️ bills.bill_id를 가리키지만 FK를 걸지 않았다 —
-                    --    수집 순서상 대안이 아직 안 들어와 있을 수 있는 전방 참조이기 때문이다.
-                    --    백필이 끝나면 전부 해소된다. 미해소분은 07번 문서의 점검 질의로 센다.
+                    --    수집 순서상 대상이 아직 안 들어와 있을 수 있는 전방 참조이기 때문이다.
     is_reexamination INTEGER,                -- reexamYn. 대통령 거부권 후 재의 대상인가.
     withdraw_count  INTEGER,                 -- withdrawCnt
     head_memo       TEXT,                    -- '비용추계요구서 제출됨.' 같은 상단 메모
@@ -250,10 +267,33 @@ CREATE TABLE IF NOT EXISTS bills (
                     --    <pre class="bill_memo">를 따로 집어야 한다.
                     -- 구조화하지 않고 원문 그대로 둔다 — 문구가 정형이 아니고 종류도 열려 있다.
                     --    "정말 통과했는가"를 물을 때 이 텍스트에 '부결'이 있는지 함께 본다.
-    promulgated_law_name TEXT,               -- 공포법률명. 공포된 법률안만 채워진다.
-                    -- ⚠️ 의안명과 다르다. 의안명 '…기본법안(대안)' → 공포법률명 '…기본법'.
-                    --    '안(대안)' 꼬리가 떨어지므로 법제처 등 바깥 자료와 이름으로 맞출 때는
-                    --    반드시 이쪽을 쓴다. 공포일은 bills가 아니라 bill_stages('공포')에 있다.
+    date_transferred TEXT,                   -- JSON `govTransDt`. 정부이송일.
+    date_promulgated TEXT,                   -- JSON `announceDt`. 공포일.
+                    -- 이 둘은 예전에 bill_stages의 '정부이송'·'공포' 단계 행이었다. 그 두 단계는
+                    -- **날짜 하나씩밖에 안 담고 있었고**(정부이송 1,540행 · 공포 1,475행),
+                    -- 위원회도 결과도 없어 "단계"라고 부를 것이 없었다. 마일스톤은 여기 컬럼으로 둔다.
+                    -- 공포된 법률의 **이름**은 bill_promulgated_laws에 있다 — 일괄개정은
+                    -- 의안 하나가 법률 여러 개를 공포하므로 컬럼 하나로는 담기지 않는다.
+
+    outcome         TEXT NOT NULL DEFAULT '계류'
+                    CHECK (outcome IN ('계류','공포','대안반영폐기','수정안반영폐기',
+                                       '본회의불부의','철회','폐기','부결','재의부결')),
+                    -- "이 법안은 결국 어떻게 됐나"의 **단일 답**. review_status·decision_result·
+                    -- reconsideration_result 셋을 함께 봐야만 나오던 답을 한 컬럼으로 굳힌 것이다.
+                    -- 유도 규칙은 `derive_outcome()`에 있고 순서가 곧 우선순위다.
+                    --
+                    -- ⚠️ **`재의부결`이 `공포`보다 먼저 판정된다.** 대통령이 거부권을 쓰고 재의에서
+                    --    부결되면 그 법은 법이 되지 못했는데 decision_result에는 '원안가결'이
+                    --    그대로 남아 있다(실측: 상법 2208496). 순서를 뒤집으면 26건이 통과로 센다.
+                    -- ⚠️ **`임기만료폐기`는 값 집합에 없다.** 유도 규칙 중 그 값을 만드는 것이
+                    --    없어서, 넣어 두면 영원히 0건인 값이 된다. 22대가 끝나 그 상태가 실제로
+                    --    생기면 그때 규칙과 함께 넣어라 — 규칙 없는 값은 조회하는 쪽에
+                    --    "이 상태가 있나 보다"라는 거짓 기대만 만든다.
+                    -- ⚠️ **상세 트랜잭션에서만 계산해 넣는다.** 목록 UPSERT는 이 컬럼을 건드리지
+                    --    않는다. 그래야 감사의 outcome_mismatch가 "저장값 ≠ 재계산값"이라는
+                    --    뜻이 되고, 목록만 바뀐 구간은 stale_details가 따로 잡는다.
+                    -- 모르는 review_status는 조용히 '계류'로 떨어진다. 감사의
+                    --    DISTINCT review_status 추이가 그 새 값을 잡는 장치다.
 
     collected_at    TEXT NOT NULL,           -- 목록 행을 처음 본 시각
     updated_at      TEXT NOT NULL,           -- 목록 정보를 마지막으로 확인한 시각
@@ -267,53 +307,119 @@ CREATE TABLE IF NOT EXISTS bills (
 CREATE INDEX IF NOT EXISTS idx_bills_proposed ON bills(date_proposed);
 CREATE INDEX IF NOT EXISTS idx_bills_kind     ON bills(bill_kind);
 CREATE INDEX IF NOT EXISTS idx_bills_status   ON bills(review_status);
-CREATE INDEX IF NOT EXISTS idx_bills_title    ON bills(title);
-CREATE INDEX IF NOT EXISTS idx_bills_alt      ON bills(alt_bill_id);
+-- idx_bills_title 은 두지 않는다. 제목 검색은 언제나 `LIKE '%…%'` 라 접두가 없고,
+-- 접두 없는 LIKE 는 인덱스를 못 쓴다. 매 INSERT 마다 쓰기 비용만 내던 인덱스였다.
+CREATE INDEX IF NOT EXISTS idx_bills_ref      ON bills(ref_bill_id);
 -- 상세 미수집 법률안을 찾는 질의가 매 실행 첫머리에 돈다.
 CREATE INDEX IF NOT EXISTS idx_bills_pending  ON bills(bill_kind, detail_collected_at);
 
 CREATE TABLE IF NOT EXISTS bill_stages (
-    -- 심사 단계. **UPDATE가 아니라 INSERT로 쌓는다.**
+    -- 심사 단계. **상태 컬럼이 아니라 사건 행으로 쌓는다.**
     --
-    -- 왜 상태 컬럼이 아니라 사건 행인가: 의안 상세 페이지 자체가 단계의 나열이다
-    -- (소관위 → 소위 → 체계자구 → 본회의 → 정부이송 → 공포). 이걸 bills의 컬럼 몇 개로
-    -- 접으면 "언제 어떻게 바뀌었나"가 사라지고, 재수집이 파괴적 연산이 된다.
-    -- 행으로 두면 재수집이 멱등해진다 — 같은 단계를 다시 봐도 같은 PK라 덮어쓸 뿐이다.
+    -- 왜 행인가: 의안 상세 페이지 자체가 단계의 나열이다(소관위 → 소위 → 체계자구 → 본회의).
+    -- 같은 단계가 여러 번 있을 수 있어서(소위가 둘) bills의 컬럼 몇 개로는 접히지 않는다.
     -- ⚠️ 조회할 때 **언제나 LEFT JOIN이다.** 대안·정부제출 법안은 소관위 회부 단계 자체가 없어
     --    이 테이블에 행이 아예 없거나 적다(이전 프로젝트 실측: 가결 법안의 64~67%).
     --    INNER JOIN하면 하필 법이 될 가능성이 가장 높은 법안들이 빠진다.
+    -- ⚠️ **이 테이블은 "어디에 언제부터"만 답한다. "어떻게 다뤄졌나"는 bill_meetings다.**
+    --    상정일을 여기서 뺀 근거: 소관위 상정일 = 그 위원회 첫 전체회의일이
+    --    15,537/15,912(98.0%), 소위는 7,203/7,370(97.7%)로 일치한다. 회의 쪽이 회의명·
+    --    회의결과·회의록 연결까지 들고 있으므로 날짜만 중복해 둘 이유가 없다.
+    --
+    -- ⚠️ **회부일은 남긴다 — 이 테이블이 존재하는 이유의 정중앙이다.** 계류 법률안
+    --    14,163건 중 처리일이 하나도 없는 것이 13,552건(95.7%)이고, 소위는 회부만 되고
+    --    회의가 한 번도 안 열린 것이 8,617건, 소관위는 3,889건이다. 회의정보만 보면
+    --    **회의가 열리기 전의 모든 상태가 통째로 안 보인다** — "언제부터 여기 묶여
+    --    있나"에 답할 곳이 회부일뿐이다.
     bill_no         TEXT NOT NULL REFERENCES bills(bill_no) ON DELETE CASCADE,
     stage           TEXT NOT NULL
-                    CHECK (stage IN ('소관위','소위','관련위','체계자구','본회의','정부이송','공포')),
+                    CHECK (stage IN ('소관위','소위','체계자구','본회의')),
                     -- '접수'는 여기 없다 — 제안일자·제안자·제안회기는 의안 자체의 속성이라
                     -- bills에 있다. 단계로 중복해 두면 두 곳이 어긋난다.
+                    -- '정부이송'·'공포'도 없다 — 날짜 하나씩밖에 없어 bills의 컬럼으로 갔다.
+                    -- '관련위'도 없다 — 4,241행 전부가 위원회명과 회부일 **둘뿐**이었고
+                    --    상정일·의견서제시일·처리결과는 원천이 칸을 비워 보내 0%였다.
+                    --    잃는 것은 "어느 관련위에 회부됐나" 하나이고, 그건 원천이 그 표의
+                    --    나머지를 안 주는 이상 더 자라지 않는 사실이다.
     seq             INTEGER NOT NULL DEFAULT 1,
-                    -- 같은 단계가 여러 번 있을 수 있다 (소위가 둘, 관련위가 여럿).
-                    -- ⚠️ **부여 규칙을 파싱 순서로 두지 마라.** 04번의 "재수집이 멱등하다"는
-                    --    주장은 같은 사건이 매번 같은 seq를 받는다는 전제 위에 서 있는데,
-                    --    보이는 순서대로 1,2,3을 매기면 원천이 행을 재정렬하거나 앞에
-                    --    끼워 넣는 순간 같은 사건이 다른 seq를 받는다. 그러면 PK가 충돌하지
-                    --    않아 UPSERT가 덮어쓰기가 아니라 **새 행 삽입**으로 동작하고,
-                    --    에러 없이 행만 늘어난다.
-                    -- 규칙: **(stage, committee_name, date_referred)로 정렬한 순위**를 쓴다.
-                    --    날짜가 없으면 상정일 → 처리일 순으로 대체하고, 셋 다 없으면
-                    --    committee_name 사전순. 전부 원천의 값이라 재파싱해도 같은 답이 나온다.
-                    -- 감사: 재수집 후 bill_stages 총 행 수가 순증하면 이 규칙이 깨진 것이다.
+                    -- 같은 단계가 여러 번 있을 수 있다 (소위가 둘 이상).
+                    -- ⚠️ **이 값의 안정성에 멱등성을 걸지 마라.** 소위는 절반(47%)이
+                    --    committee_name이 비어 정렬 타이가 생기고, 타이가 뒤집히면 같은
+                    --    사건이 다른 seq를 받는다. 그러면 PK가 안 부딪혀 UPSERT가
+                    --    덮어쓰기가 아니라 **삽입**으로 동작하고 에러 없이 행만 는다.
+                    -- 그래서 이 테이블은 UPSERT를 쓰지 않는다. 의안 하나의 단계 전부를
+                    --    **한 트랜잭션 안에서 DELETE 후 INSERT** 한다(replace_children).
+                    --    의안 1건이 1 트랜잭션이라 실패하면 통째로 롤백되고,
+                    --    멱등성이 정렬 안정성과 무관해진다.
     committee_name  TEXT REFERENCES committees(committee_name),
-                    -- 소관위·소위·관련위·체계자구 단계의 위원회. 본회의·정부이송·공포는 NULL.
                     -- ⚠️ 여기를 자유 텍스트로 두면 committees와 표기가 갈라져서
                     --    "이 위원회를 거친 법안 전부"가 조용히 일부만 준다.
     date_referred   TEXT,                    -- 회부일
-    date_presented  TEXT,                    -- 상정일  (본회의는 상정일)
-    date_processed  TEXT,                    -- 처리일  (본회의는 의결일, 정부이송은 이송일, 공포는 공포일)
+    date_processed  TEXT,                    -- 처리일 (본회의는 의결일)
     result          TEXT,                    -- 처리결과 · 회의결과
                     -- ⚠️ 값 집합이 본회의와 위원회에서 다르다. 위원회에는 '대안가결'이 있다.
-                    -- ⚠️ **대안반영폐기가 위원회 단계에만 적히는 경우가 있다**(이전 프로젝트 실측 459~487건).
-                    --    본회의에 못 올라가고 소관위에서 종료된 원안이 그렇다.
-                    --    "대안에 흡수된 법안"을 bills.decision_result로만 찾으면 그 500건 가까이를 놓친다.
-    ref_no          TEXT,                    -- 공포번호 등 단계별 부가 식별자
-    doc_url         TEXT,                    -- 검토보고서·심사보고서 등
+                    -- ⚠️ **대안반영폐기가 위원회 단계에만 적히는 경우가 있다.** 본회의에 못
+                    --    올라가고 소관위에서 끝난 원안이 그렇다. "대안에 흡수된 법안"을
+                    --    bills.decision_result로만 찾으면 그 부류를 놓친다 — bills.outcome이나
+                    --    bill_alternatives를 써라.
     PRIMARY KEY (bill_no, stage, seq)
+    -- ⚠️ **같은 NULL이 단계마다 다른 뜻이다. 이 표 없이 SQL을 쓰면 에러 없이 틀린다.**
+    --    (v1 실측 · 재수집 후 다시 잰다)
+    --
+    --      단계      행수     위원회        회부일   처리일  결과
+    --      ────────────────────────────────────────────────────────
+    --      소관위    20,702   100%          95%      32%     32%
+    --      소위      16,432   47%           98%      32%     32%
+    --      체계자구   1,501   상수(법사위)  100%     97%     97%
+    --      본회의     5,885   없음          없음     100%    100%
+    --
+    --    굵은 자리(체계자구의 위원회 · 본회의의 위원회와 회부일)는 **원천에 칸이 아예
+    --    없는 것**이고, 낮은 값(소관위 처리 32%)은 *아직 그 사건이 안 일어난 것*이다.
+    --    체계자구의 위원회명은 표가 아니라 캡션('법사위 체계자구 심사정보')에 있다.
+    --    소관위의 회부 95% ↔ 처리 32% 사이가 계류 14,163건의 실체다.
+);
+
+CREATE TABLE IF NOT EXISTS bill_alternatives (
+    -- 대안 관계. "이 원안이 어느 대안에 흡수됐나"와 그 역방향을 같은 표가 답한다.
+    --
+    -- 원천은 anBillInfo.do(대안 탭) 하나이고 **한 번에 양방향을 준다** — 의안 하나를 물으면
+    -- 그것을 흡수한 대안 1건과 **같이 흡수된 형제 전부**(최대 246건)를 함께 돌려준다.
+    -- 그래서 한 의안을 받으면 형제들의 행까지 같이 만들어진다.
+    -- 원천 템플릿이 라벨을 이렇게 가른다: refIdCount > 0 ? '대안반영폐기 의안 (N건)' : '대안'.
+    --
+    -- ⚠️ **bills.ref_bill_id로 이 관계를 대신하지 마라.** 그 컬럼은 두 얼굴이고 241건이
+    --    대안이 아닌 다른 관계다(bills.ref_bill_id 주석). 확실한 관계는 여기에만 있다.
+    -- 측정: 대안반영폐기 3,839 + 본회의불부의 317 = 4,156건이 **전부** 위원장 발의 +
+    --    제목에 '(대안)'으로 해소된다. 한 건도 예외가 없었다.
+    bill_no         TEXT NOT NULL REFERENCES bills(bill_no) ON DELETE CASCADE,
+                    -- 흡수된 원안.
+    alt_bill_no     TEXT NOT NULL,
+                    -- 흡수한 대안의 의안번호.
+                    -- ⚠️ FK를 걸지 않는다 — 대안이 아직 목록에 안 들어와 있을 수 있는
+                    --    전방 참조다. 대안이 정식 접수되면 같은 번호로 들어와 해소된다.
+    PRIMARY KEY (bill_no, alt_bill_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_alternatives_alt ON bill_alternatives(alt_bill_no);
+
+CREATE TABLE IF NOT EXISTS bill_promulgated_laws (
+    -- 이 의안으로 공포된 법률들. **의안당 여러 행이다.**
+    --
+    -- 왜 bills의 컬럼이 아닌가: 일괄개정 의안 하나가 법률 여러 개를 한꺼번에 공포한다
+    -- (실측 53건, 최대 10개 — 2201193). 컬럼 하나로 두면 나머지가 조용히 버려지고,
+    -- 버려진 줄 아무도 모른다. 공포일은 의안 단위 사실이라 bills.date_promulgated에 있다.
+    bill_no         TEXT NOT NULL REFERENCES bills(bill_no) ON DELETE CASCADE,
+    law_name        TEXT NOT NULL,
+                    -- 공포법률명.
+                    -- ⚠️ **의안명과 다르다.** 의안명 '…기본법안(대안)' → 공포법률명 '…기본법'.
+                    --    '안(대안)' 꼬리가 떨어지므로 법제처 등 바깥 자료와 이름으로 맞출 때는
+                    --    반드시 이쪽을 쓴다.
+    law_no          TEXT,                    -- 공포번호
+    PRIMARY KEY (bill_no, law_name)
+                    -- ⚠️ seq를 키로 쓰지 않는 이유는 bill_stages.seq의 그것과 같다 —
+                    --    순서로 키를 만들면 원천이 행을 재정렬할 때 같은 사실이 다른 키를 받고,
+                    --    그러면 재수집이 덮어쓰기가 아니라 삽입이 된다. 한 의안이 같은 법률을
+                    --    두 번 공포하지 않으므로 이름이 안정된 키다.
 );
 
 CREATE TABLE IF NOT EXISTS bill_proposers (
@@ -321,6 +427,12 @@ CREATE TABLE IF NOT EXISTS bill_proposers (
     bill_no         TEXT NOT NULL REFERENCES bills(bill_no) ON DELETE CASCADE,
     open_na_id      TEXT NOT NULL REFERENCES members(open_na_id),
     role            TEXT NOT NULL CHECK (role IN ('대표발의','공동발의')),
+                    -- ⚠️ **대표발의가 한 명이라고 가정하지 마라 — 공동대표발의가 있다.**
+                    --    원천이 팝업의 숨은 필드로 직접 말해 준다:
+                    --    `<input id="info" value="최형두의원ㆍ이준석의원ㆍ황정아의원 등 11인">`.
+                    --    v1은 상세 HTML의 **첫 번째** /members/ 링크만 대표로 잡아서
+                    --    `role='대표발의'`가 2명 이상인 의안이 **0건**이었다 — 있는데 없는 것으로
+                    --    보였고, 0건은 에러가 아니라 그대로 답이 됐다.
                     -- ⚠️ **이 테이블만 조인하면 가결 법안의 64%가 조용히 사라진다.**
                     --    위원장 대안(실측 22대 934건)·정부제출(601건)에는 개별 의원 발의자가 없다.
                     --    그리고 하필 법이 되는 것은 대부분 위원장 대안 쪽이다.
@@ -804,6 +916,39 @@ BILL_LIST_COLS = ("bill_id", "assembly_unit", "bill_kind", "title", "proposer_ki
 BILL_LIST_INSERT_ONLY = ("bill_kind",)
 
 
+#: bills.outcome 이 가질 수 있는 값 전부. SQL의 CHECK와 **같아야 한다** — selftest가 대조한다.
+OUTCOME_VALUES = ("계류", "공포", "대안반영폐기", "수정안반영폐기",
+                  "본회의불부의", "철회", "폐기", "부결", "재의부결")
+
+#: review_status / decision_result 가 그 이름 그대로 결말인 값들.
+_TERMINAL = ("대안반영폐기", "수정안반영폐기", "본회의불부의", "철회", "폐기")
+
+
+def derive_outcome(review_status: str | None, decision_result: str | None,
+                   reconsideration_result: str | None) -> str:
+    """세 컬럼을 "결국 어떻게 됐나" 하나로 접는다. **순서가 곧 우선순위다.**
+
+    모르는 값은 ``'계류'``로 떨어진다. 그게 조용한 실패로 보일 수 있지만, 대안은 예외를
+    던져 수집을 멈추는 것뿐이고 국회는 새 상태 문자열을 예고 없이 늘린다. 그래서 떨어뜨리되
+    감사의 ``DISTINCT review_status`` 추이가 새 값의 등장을 잡는다.
+    """
+    # ⚠️ **이 검사가 맨 앞이어야 한다.** 대통령 거부권 뒤 재의에서 부결되면 그 법은 법이
+    #    되지 못했는데 decision_result 에는 '원안가결' 이 그대로 남아 있다(실측 상법 2208496).
+    #    한 칸이라도 뒤로 밀면 26건이 통과로 센다.
+    if reconsideration_result == "부결" or review_status == "재의(부결)":
+        return "재의부결"
+    if review_status == "공포":
+        return "공포"
+    if review_status in _TERMINAL:
+        return review_status
+    # 여기부터는 review_status 가 아직 안 따라온 구간이다. 의결결과가 먼저 확정된다.
+    if decision_result == "부결":
+        return "부결"
+    if decision_result in _TERMINAL:
+        return decision_result
+    return "계류"
+
+
 def upsert_bill_list(db: sqlite3.Connection, row: dict) -> None:
     """목록 행을 넣거나 갱신한다. **이미 받아 둔 상세 컬럼은 건드리지 않는다.**
 
@@ -857,6 +1002,30 @@ def replace_children(db: sqlite3.Connection, table: str, parent_col: str, parent
     elif len(rows) != expected:
         raise PartialListError(f"{table}: {len(rows)}행을 받았는데 기대는 {expected}행")
 
+    db.execute(f"DELETE FROM {table} WHERE {parent_col} = ?", (parent_val,))
+    if not rows:
+        return 0
+    cols = list(rows[0])
+    db.executemany(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+        [[r[c] for c in cols] for r in rows])
+    return len(rows)
+
+
+def replace_children_txn(db: sqlite3.Connection, table: str, parent_col: str, parent_val,
+                         rows: list[dict]) -> int:
+    """건수를 묻지 않고 자식 목록을 갈아 끼운다. **호출자가 트랜잭션 안에 있어야 한다.**
+
+    ``replace_children``을 쓸 수 없는 목록이 있다. ``bill_stages``가 그렇다 —
+    원천이 단계 개수를 **선언하지 않고**, 0건도 정상이다(대안·정부제출 의안은 소관위 회부
+    단계 자체가 없다). 그래서 기대 건수로 지킬 것이 없다.
+
+    ⚠️ **그렇다고 ``expected=len(rows)``로 부르지 마라.** 그건 언제나 참이라 검사가 아니고,
+       이 프로젝트에서 발의자 34,270명이 사라진 방식이 정확히 그것이다.
+    보호는 기대 건수가 아니라 **트랜잭션**이 한다: 파싱이 중간에 실패하면 예외가 올라가
+    의안 하나짜리 트랜잭션이 통째로 롤백되고, 옛 행이 그대로 남는다. 그래서 UPSERT 대신
+    DELETE+INSERT를 쓸 수 있고, 멱등성이 seq 정렬의 안정성과 무관해진다.
+    """
     db.execute(f"DELETE FROM {table} WHERE {parent_col} = ?", (parent_val,))
     if not rows:
         return 0
@@ -952,8 +1121,11 @@ COMMENT_GUARDS = {
     "members": "동명이인",
     "bills": "영구키",
     "committees": "자동 등록",
-    "bill_stages": "INSERT로 쌓는다",
+    "bill_stages": "다른 뜻이다",
     "meetings": "국정감사",
+    "bill_alternatives": "양방향",
+    "bill_promulgated_laws": "일괄개정",
+    "bill_proposers": "공동대표발의",
 }
 
 
@@ -976,9 +1148,10 @@ def selftest(db_path: str) -> int:
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     expected = {"committees", "members", "member_committees", "bills", "bill_stages",
                 "bill_proposers", "bill_vote_summary", "bill_votes", "bill_meetings",
+                "bill_alternatives", "bill_promulgated_laws",
                 "meetings", "meeting_speakers", "meeting_utterances", "meeting_agenda",
                 "collect_failures"}
-    check("테이블 14개", expected <= tables, str(sorted(expected - tables)))
+    check("테이블 16개", expected <= tables, str(sorted(expected - tables)))
     check("뷰 없음", not {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='view'")})
     check("FTS 없음", not any("_fts" in t for t in tables))
     check("bills에 상태 컬럼 없음",
@@ -1079,23 +1252,96 @@ def selftest(db_path: str) -> int:
     check("bills 행이 늘지 않았다",
           db.execute("SELECT COUNT(*) FROM bills").fetchone()[0] == 1)
 
-    # ── bill_stages: 같은 단계를 다시 봐도 행이 안 는다
-    stage = dict(bill_no="2214631", stage="소관위", seq=1,
-                 committee_name="과학기술정보방송통신위원회", date_referred="2025-11-28")
-    for _ in range(3):
-        db.execute("""INSERT INTO bill_stages (bill_no, stage, seq, committee_name, date_referred)
-                      VALUES (:bill_no, :stage, :seq, :committee_name, :date_referred)
-                      ON CONFLICT(bill_no, stage, seq) DO UPDATE SET
-                          committee_name = excluded.committee_name,
-                          date_referred  = excluded.date_referred""", stage)
-    check("같은 단계를 세 번 넣어도 1행",
-          db.execute("SELECT COUNT(*) FROM bill_stages").fetchone()[0] == 1)
+    # ── bill_stages: DELETE+INSERT 라 정렬 타이가 뒤집혀도 행이 안 는다
+    #
+    # ⚠️ 이게 UPSERT 였을 때의 사고를 재현한다. 소위는 절반이 committee_name 이 비어
+    #    정렬 타이가 생기는데, 타이가 뒤집히면 같은 사건이 다른 seq 를 받아 PK 가 안
+    #    부딪히고 **에러 없이 행만 는다.** 아래 두 번째 루프가 순서를 바꿔 넣는다.
+    def _stage(seq, ref):
+        return dict(bill_no="2214631", stage="소위", seq=seq, committee_name=None,
+                    date_referred=ref, date_processed=None, result=None)
+
+    for rows in ([_stage(1, "2025-12-01"), _stage(2, "2025-12-02")],
+                 [_stage(1, "2025-12-02"), _stage(2, "2025-12-01")],   # 타이가 뒤집힌 재파싱
+                 [_stage(1, "2025-12-01"), _stage(2, "2025-12-02")]):
+        replace_children_txn(db, "bill_stages", "bill_no", "2214631", rows)
+    check("정렬이 뒤집혀 다시 들어와도 2행 그대로",
+          db.execute("SELECT COUNT(*) FROM bill_stages").fetchone()[0] == 2,
+          str(db.execute("SELECT COUNT(*) FROM bill_stages").fetchone()[0]))
+    check("빈 목록이면 그 의안의 단계가 사라진다 (0건이 정상인 의안이 있다)",
+          replace_children_txn(db, "bill_stages", "bill_no", "2214631", []) == 0
+          and db.execute("SELECT COUNT(*) FROM bill_stages").fetchone()[0] == 0)
+    replace_children_txn(db, "bill_stages", "bill_no", "2214631",
+                         [dict(bill_no="2214631", stage="소관위", seq=1,
+                               committee_name="과학기술정보방송통신위원회",
+                               date_referred="2025-11-28", date_processed=None, result=None)])
+
+    # ── outcome: 순서가 곧 우선순위다
+    check("CHECK 값 집합과 OUTCOME_VALUES 가 일치한다",
+          all(v in schema_sql["bills"] for v in OUTCOME_VALUES)
+          and len(OUTCOME_VALUES) == len(set(OUTCOME_VALUES)))
+    # ⚠️ 이 한 줄이 이 테스트의 핵심이다. 재의부결이 뒤로 밀리면 26건이 '공포'로 센다.
+    check("재의부결이 공포보다 먼저 판정된다",
+          derive_outcome("공포", "원안가결", "부결") == "재의부결",
+          derive_outcome("공포", "원안가결", "부결"))
+    for rs, dr, rr, want in (
+            ("재의(부결)", "원안가결", None, "재의부결"),
+            ("공포", "원안가결", None, "공포"),
+            ("공포", "원안가결", "가결", "공포"),
+            ("대안반영폐기", "대안반영폐기", None, "대안반영폐기"),
+            ("수정안반영폐기", "수정안반영폐기", None, "수정안반영폐기"),
+            ("본회의불부의", None, None, "본회의불부의"),
+            ("철회", "철회", None, "철회"),
+            ("폐기", "폐기", None, "폐기"),
+            ("본회의의결", "부결", None, "부결"),
+            ("소관위심사", None, None, "계류"),
+            ("정부이송", "원안가결", None, "계류"),
+            (None, None, None, "계류"),
+            ("국회가 내년에 만들 새 상태", None, None, "계류")):
+        got = derive_outcome(rs, dr, rr)
+        check(f"outcome({rs!r},{dr!r},{rr!r}) = {want}", got == want, got)
+    check("유도 결과가 전부 CHECK 안의 값이다",
+          all(derive_outcome(rs, dr, rr) in OUTCOME_VALUES
+              for rs in (None, "공포", "철회", "소관위심사", "재의(부결)")
+              for dr in (None, "원안가결", "부결", "대안반영폐기")
+              for rr in (None, "부결", "가결")))
+    db.execute("UPDATE bills SET outcome = '공포' WHERE bill_no = '2214631'")
+    try:
+        db.execute("UPDATE bills SET outcome = '임기만료폐기' WHERE bill_no = '2214631'")
+        check("CHECK가 임기만료폐기를 거부한다", False, "통과해 버렸다 — 규칙 없는 값이다")
+    except sqlite3.IntegrityError:
+        check("CHECK가 임기만료폐기를 거부한다", True)
+    db.execute("UPDATE bills SET outcome = '계류' WHERE bill_no = '2214631'")
+
+    # ── 새 표 둘: 같은 상세를 두 번 넣어도 행 수가 안 변한다
+    alts = [dict(bill_no="2214631", alt_bill_no="2216765"),
+            dict(bill_no="2214631", alt_bill_no="2216766")]
+    for _ in range(2):
+        replace_children_txn(db, "bill_alternatives", "bill_no", "2214631", alts)
+    check("대안 관계를 두 번 넣어도 2행",
+          db.execute("SELECT COUNT(*) FROM bill_alternatives").fetchone()[0] == 2)
+    # ⚠️ alt_bill_no 에 FK 가 있으면 여기서 터진다. 대안이 원안보다 늦게 접수되는 것이
+    #    정상이라 전방 참조를 막으면 그 관계를 통째로 못 담는다.
+    check("아직 목록에 없는 대안을 가리켜도 들어간다",
+          db.execute("SELECT COUNT(*) FROM bills WHERE bill_no='2216765'").fetchone()[0] == 0)
+
+    laws = [dict(bill_no="2214631", law_name="소프트웨어 진흥법", law_no="20001"),
+            dict(bill_no="2214631", law_name="정보통신망 이용촉진 및 정보보호 등에 관한 법률",
+                 law_no="20002")]
+    for _ in range(2):
+        replace_children_txn(db, "bill_promulgated_laws", "bill_no", "2214631", laws)
+    check("일괄개정이 의안 하나에 법률 여러 개를 담는다",
+          db.execute("SELECT COUNT(*) FROM bill_promulgated_laws").fetchone()[0] == 2)
 
     # ── CHECK 제약이 오타 상태값을 막는다
     for sql, label in (
             ("INSERT INTO bill_votes VALUES ('2214631','KIMHyun','찬성이')", "vote 오타 거부"),
             ("INSERT INTO bill_proposers VALUES ('2214631','KIMHyun','대표빌의')", "role 오타 거부"),
             ("INSERT INTO bill_stages (bill_no,stage) VALUES ('2214631','접수')", "stage 오타 거부"),
+            # 이 셋은 v2에서 단계에서 빠진 값들이다. 파서가 옛 코드를 남겨 두면 여기서 걸린다.
+            ("INSERT INTO bill_stages (bill_no,stage) VALUES ('2214631','관련위')", "관련위 거부"),
+            ("INSERT INTO bill_stages (bill_no,stage) VALUES ('2214631','정부이송')", "정부이송 거부"),
+            ("INSERT INTO bill_stages (bill_no,stage) VALUES ('2214631','공포')", "공포 거부"),
             ("INSERT INTO collect_failures (target_kind,target_key,kind) "
              "VALUES ('bill_detail','1','retriabel')", "kind 오타 거부")):
         try:
