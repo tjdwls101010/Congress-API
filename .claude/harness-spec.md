@@ -38,13 +38,15 @@
 | B2 | 국회 질문이 WebSearch·OpenAPI로 새지 않게 한다 | 모든 세션이 알아야 하고, 스킬이 뜨기 *전에* 알아야 한다 | `CLAUDE.md` | validated |
 | B3 | 수집을 하루 1회 돌리고 조용히 멈추면 알린다 | 이벤트 기반이고 사람이 없을 때 돌아야 한다 | `.github/workflows/scheduled-collect.yml` | validated |
 | B4 | 수집이 멈춘 것을 맥 **밖**에서 감시한다 | 감시 대상이 맥이므로 감시자가 맥 안에 있으면 같이 죽는다 | `.github/workflows/collect-watchdog.yml` | validated |
-| B5 | `Scripts/*.py` 편집 시 `selftest`를 자동으로 돌린다 | 매번 예외 없이 일어나야 하는 일 → 훅 | (미생성) | proposed — v2 1단계 직후 |
+| B5 | `Scripts/*.py` 편집 시 `selftest`를 자동으로 돌린다 | 매번 예외 없이 일어나야 하는 일 → 훅 | `.claude/hooks/selftest-on-parser-edit.sh` | validated |
 | B6 | 점검·조회 명령을 프롬프트 없이 허용한다 | 특정 명령의 허용/차단 → `permissions` | `.claude/settings.json` | validated |
 | B7 | 파서 작성 규칙을 `Scripts/*.py`에서만 로드한다 | 트리의 한 부분에서만 쓰이는 규칙 → 경로 한정 rule | `.claude/rules/parsers.md` | validated |
 
-**B5만 아직 없고, 그건 시점 문제다.** 훅이 `selftest`를 돌리는데 v2 1단계가 `SCHEMA`를 통째로 다시 쓰므로, 그동안 켜 두면 편집마다 빨간불이 뜬다. 그런데 `PostToolUse`의 exit 2는 stderr를 루프로 되먹이므로 이건 소음에 그치지 않는다 — **의도적으로 깨 둔 중간 상태를 고치려 드는 쪽으로 세션을 끈다.**
+**셋 다 있다. B5는 계획서의 7단계가 아니라 1단계 직후에 켰다.**
 
-계획서는 그래서 B5를 맨 마지막(7단계)에 뒀는데, **그건 필요보다 다섯 단계 늦다.** 소음 구간은 1단계뿐이다. 2단계는 `bills.py`·`members.py`·`meetings.py`만 건드리고 `db.py`는 그대로라 `selftest`가 초록불로 남는다. 그리고 파서 3종을 동시에 뜯는 2단계야말로 B5가 지키라고 만들어진 구간이다. **1단계의 판정("`selftest` 전부 통과")이 그대로 B5를 켜는 신호다.**
+훅이 `selftest`를 돌리는데 v2 1단계가 `SCHEMA`를 통째로 다시 쓰므로 그동안 켜 두면 편집마다 빨간불이 뜬다. 그리고 `PostToolUse`의 exit 2는 stderr를 루프로 되먹이므로 이건 소음에 그치지 않는다 — **의도적으로 깨 둔 중간 상태를 고치려 드는 쪽으로 세션을 끈다.** 계획서가 B5를 뒤로 민 것은 옳다.
+
+그런데 7단계는 **필요보다 다섯 단계 늦다.** 소음 구간은 1단계뿐이다. 2단계는 `bills.py`·`members.py`·`meetings.py`만 건드리고 `db.py`는 그대로라 `selftest`가 초록불로 남는다. 그리고 파서 3종을 동시에 뜯는 2단계야말로 B5가 지키라고 만들어진 구간이다. 그래서 **1단계의 판정("`selftest` 전부 통과")을 그대로 B5를 켜는 신호로 썼다.**
 
 ## Component specs
 
@@ -100,6 +102,20 @@ deny는 `Bash(git clean:*)` 하나다. 이건 실제로 DB를 날렸던 사건(`
 > ⚠️ **신뢰되지 않은 새 클론에서는 allow가 통째로 죽고 deny만 산다.** workspace trust는 저장소가 *허용*하는 것만 막고 *제한*하는 것은 막지 않는다. 프로젝트 훅도 같이 죽으므로 B5가 생긴 뒤에는 더 중요해진다.
 
 **settings.json은 세션 시작 때 읽힌다.** 만든 세션에서는 안 먹는다.
+
+### `.claude/hooks/selftest-on-parser-edit.sh` — `PostToolUse` (B5)
+
+비용이 사실상 0이라 디바운스도 배치도 없다 — `selftest`가 **0.063초**다. 매 편집마다 돌려도 사람이 느끼지 못한다.
+
+**성공 시 침묵이 설계의 핵심이다.** 편집마다 "전부 통과"를 출력하면 40번의 편집이 40줄의 노이즈가 되고, 그러면 41번째의 진짜 실패가 그 안에 묻힌다. 훅은 할 말이 있을 때만 말한다.
+
+매처가 `Write|Edit` 전체라 **실제 필터는 스크립트 안에 있고, 그 조건이 이 훅의 유일한 정확성 보장이다.** 그래서 검증도 거기에 맞춘다 — 경로 둘을 넣어 exit code만 보면 **둘 다 0이라 아무것도 증명되지 않는다.** `db.py`를 일부러 깨 두고 두 경로를 다시 넣어야 "안쪽은 2, 바깥쪽은 0"이 갈린다.
+
+> ⚠️ **`test_hook.py --input-field`는 점 표기를 중첩해 주지 않는다.** `--input-field 'tool_input.file_path=…'`는 그 이름의 **평평한 키**를 하나 더 붙일 뿐이고 중첩된 `tool_input.file_path`는 샘플 기본값(`/tmp/example.txt`)으로 남는다. 그러면 훅이 무시 경로를 타면서 exit 0을 돌려주고, 그게 통과로 읽힌다. 객체를 통째로 넘겨라: `--input-field 'tool_input={"file_path":"…"}'`. 계획서 06번의 검증 스니펫이 평평한 형태로 적혀 있다.
+
+> ⚠️ 스크립트가 임시 DB를 만들 때 **`mktemp -d`다. `-u`가 아니다.** `-u`는 경로 문자열만 만들고 디렉터리를 안 만들어 sqlite가 파일을 못 연다 — 훅이 매번 실패해 곧 무시하게 된다. 계획서 스니펫이 `-u`로 적혀 있었다.
+
+> ⚠️ **`selftest`는 첫 동작이 대상 DB 삭제다.** 훅은 `mktemp` 경로만 넘기고, `db.py`의 argparse 가드가 두 번째 겹으로 막는다. **그 가드를 이 훅 편의를 위해 완화하지 마라.**
 
 ### `.claude/rules/parsers.md` — 경로 한정 rule (B7)
 
