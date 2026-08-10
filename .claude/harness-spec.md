@@ -38,11 +38,13 @@
 | B2 | 국회 질문이 WebSearch·OpenAPI로 새지 않게 한다 | 모든 세션이 알아야 하고, 스킬이 뜨기 *전에* 알아야 한다 | `CLAUDE.md` | validated |
 | B3 | 수집을 하루 1회 돌리고 조용히 멈추면 알린다 | 이벤트 기반이고 사람이 없을 때 돌아야 한다 | `.github/workflows/scheduled-collect.yml` | validated |
 | B4 | 수집이 멈춘 것을 맥 **밖**에서 감시한다 | 감시 대상이 맥이므로 감시자가 맥 안에 있으면 같이 죽는다 | `.github/workflows/collect-watchdog.yml` | validated |
-| B5 | `Scripts/*.py` 편집 시 `selftest`를 자동으로 돌린다 | 매번 예외 없이 일어나야 하는 일 → 훅 | (미생성) | proposed |
-| B6 | 읽기 전용 점검 명령을 프롬프트 없이 허용한다 | 특정 명령의 허용/차단 → `permissions` | (미생성) | proposed |
-| B7 | 파서 작성 규칙을 `Scripts/**`에서만 로드한다 | 트리의 한 부분에서만 쓰이는 규칙 → 경로 한정 rule | (미생성) | proposed |
+| B5 | `Scripts/*.py` 편집 시 `selftest`를 자동으로 돌린다 | 매번 예외 없이 일어나야 하는 일 → 훅 | (미생성) | proposed — v2 1단계 직후 |
+| B6 | 점검·조회 명령을 프롬프트 없이 허용한다 | 특정 명령의 허용/차단 → `permissions` | `.claude/settings.json` | generated |
+| B7 | 파서 작성 규칙을 `Scripts/*.py`에서만 로드한다 | 트리의 한 부분에서만 쓰이는 규칙 → 경로 한정 rule | `.claude/rules/parsers.md` | generated |
 
-B5–B7은 **거절이 아니라 보류다.** 2026-08-09 세션이 근거를 남겼고(아래 Change history) 다음 패스가 판단한다.
+**B5만 아직 없고, 그건 시점 문제다.** 훅이 `selftest`를 돌리는데 v2 1단계가 `SCHEMA`를 통째로 다시 쓰므로, 그동안 켜 두면 편집마다 빨간불이 뜬다. 그런데 `PostToolUse`의 exit 2는 stderr를 루프로 되먹이므로 이건 소음에 그치지 않는다 — **의도적으로 깨 둔 중간 상태를 고치려 드는 쪽으로 세션을 끈다.**
+
+계획서는 그래서 B5를 맨 마지막(7단계)에 뒀는데, **그건 필요보다 다섯 단계 늦다.** 소음 구간은 1단계뿐이다. 2단계는 `bills.py`·`members.py`·`meetings.py`만 건드리고 `db.py`는 그대로라 `selftest`가 초록불로 남는다. 그리고 파서 3종을 동시에 뜯는 2단계야말로 B5가 지키라고 만들어진 구간이다. **1단계의 판정("`selftest` 전부 통과")이 그대로 B5를 켜는 신호다.**
 
 ## Component specs
 
@@ -79,6 +81,40 @@ verify.py        국회 사이트가 바뀌었나    네트워크 있음 · DB �
 
 러너는 `~/actions-runner-congress-api` (`congress-api-seongjin-mac`)다. **`~/actions-runner-congress`는 이 저장소가 아니다** — 지금도 살아 도는 `Congress-DB` 소속이니 건드리지 마라.
 
+### `.claude/settings.json` — permissions (B6)
+
+**이건 편의이지 안전이 아니다.** 2026-08-09 세션의 판단을 그대로 유지한다. 편의만 주는 변경이라 범위를 좁게 잡았다.
+
+allow는 **명령 이름이 아니라 경로까지 박는다.** `Bash(uv run:*)`처럼 열면 `uv run`으로 무엇이든 실행할 수 있어 규칙이 의미를 잃고, 게다가 넓은 allow 규칙은 세션이 auto 모드로 들어가는 순간 자동으로 정지된다 — 좁은 규칙만 모든 모드에서 계속 작동한다.
+
+> ⚠️ **네 `uv run` 규칙 중 둘은 읽기 전용이 아니다.** `db.py schema`와 `collect.py --audit-only`는 본래 일을 하기 전에 `init_schema()`를 탄다(`db.py:1259` · `collect.py:76`). 그건 `executescript(SCHEMA)`로 **경로가 비어 있으면 DB를 만들고**, 이어 `migrate_comments()`가 주석만 어긋난 테이블의 DDL을 `writable_schema`로 **제자리에서 갈아 끼운다.** 의도된 설계이고(구조가 다르면 손대지 않고 이름만 돌려준다) 앞뒤로 `integrity_check`가 붙지만, 프롬프트 없이 도는 것이 순수 조회는 아니다. 알고 허용한 것이다.
+
+> ⚠️ **이 규칙들은 상대 경로 호출에만 걸린다.** SKILL.md는 `{skill_dir}/Scripts/…`를 가르치고 클로드는 그걸 절대 경로로 편다. 그래서 스킬 안에서의 호출은 여기가 아니라 스킬 자신의 `allowed-tools: Bash(uv run:*)`가 담당한다. **B6의 실제 수혜자는 유지보수 세션이다** — `harness-spec.md`와 계획서가 상대 경로로 적어 둔 그 형태.
+
+`sqlite3`는 넣지 않았다. 같은 명령으로 `DROP TABLE`도 되고 하위 명령으로 읽기와 쓰기를 가를 방법이 없다. 조회는 스킬의 `allowed-tools`가 이미 담당하므로 잃는 것도 없다. `selftest`도 넣지 않았다 — 대상 DB를 지우는 명령이 프롬프트 없이 도는 것은 편의로 살 값이 아니다.
+
+deny는 `Bash(git clean:*)` 하나다. 이건 실제로 DB를 날렸던 사건(`actions/checkout`의 `git clean -ffdx`가 gitignore된 DB까지 지운다)을 겨눈다.
+
+> ⚠️ **`Bash(rm:*CONGRESS.db*)`를 다시 시도하지 마라 — 아무것도 매칭하지 않는다.** Bash 규칙의 `:*`는 **접두** 매칭이고 와일드카드는 패턴을 끝맺어야 한다. 중간에 `*`를 넣은 저 문자열은 `rm:*CONGRESS.db*`라는 이름의 명령을 정확히 찾는 규칙이 되어 영원히 안 걸린다. **보호처럼 보이면서 아무것도 보호하지 않는 최악의 모양이다.** 경로를 좁힐 문법이 없어서 선택지는 `Bash(rm:*)` 전면 차단뿐이었고, rm으로 데이터를 잃은 적은 없어서(4.25GB는 `selftest`였고 argparse 가드가 이미 막는다) 넣지 않기로 했다.
+
+> ⚠️ **신뢰되지 않은 새 클론에서는 allow가 통째로 죽고 deny만 산다.** workspace trust는 저장소가 *허용*하는 것만 막고 *제한*하는 것은 막지 않는다. 프로젝트 훅도 같이 죽으므로 B5가 생긴 뒤에는 더 중요해진다.
+
+**settings.json은 세션 시작 때 읽힌다.** 만든 세션에서는 안 먹는다.
+
+### `.claude/rules/parsers.md` — 경로 한정 rule (B7)
+
+보류 이유였던 "스키마 주석과 겹친다"의 답은 **독자와 시점이 다르다**는 것이다. 스키마 주석은 `.schema`를 부를 때, 즉 **조회할 때** 읽히고 "이 값이 무엇이고 어떻게 조인하나"를 담는다. 이 규칙은 `Scripts/*.py`를 열 때, 즉 **코드를 쓸 때** 읽히고 "이 원천을 어떻게 긁어야 안 깨지나"를 담는다. 조회하는 클로드는 `re.match` 함정을 알 필요가 없고, 파서를 쓰는 클로드는 그것만 알면 된다.
+
+담은 기준은 **이 프로젝트에서 실제로 데이터를 잃게 만든 것만**이다. 일반적인 파이썬 조언은 넣지 않았고, 넣을 만한 것은 원천의 사실 쪽으로 다시 썼다 — `re.search`를 쓰라가 아니라 "이 원천은 값 주위에 공백과 개행을 대량으로 넣는다"로. 규칙이 아니라 사실이어야 다음에 나올 변종에도 적용된다.
+
+> ⚠️ **`paths:` 프론트매터가 없으면 이 파일은 CLAUDE.md와 똑같이 매 세션 로드된다.** 그러면 `rules/`로 나눈 의미가 통째로 없어진다. `validate_harness.py`의 always-loaded 합계가 7줄로 남아 있는지가 그 확인이다.
+
+패턴을 `*.py`와 `**/*.py` 둘 다 적었다. 지금 `Scripts/`에는 하위 디렉터리가 없어 앞엣것이면 충분하지만, `**`가 "0개 이상"인지 "1개 이상"인지에 따라 뒤엣것만으로는 오늘의 파일이 하나도 안 걸릴 수 있다. **규칙이 안 걸리는 것은 에러가 아니라 조용한 미로드다.**
+
+⚠️ `paths:`가 붙은 규칙은 **컴팩션 후 다시 주입되지 않는다.** 파서를 오래 고치는 세션에서 중간에 사라질 수 있다. 그래도 여기 두는 것이 맞다 — 이 교훈들의 최악은 "조금 뒤에 다시 알게 됨"이지 돌이킬 수 없는 손해가 아니고, 매 세션 CLAUDE.md 예산을 쓸 값은 아니다.
+
+**계획서 06번에서 하나를 뒤집었다.** 거기 적힌 "개수는 제목의 `등 N인`에서 와라"를 쓰지 않는다. 제목 파싱은 `외 N인` 44건과 위원장·정부 발의 1,654건에서 깨진다. 대신 **같은 응답 안에서 원천이 스스로 선언한 총원**(팝업의 `pager_count_text`, JSON의 `proposerInfo`)을 쓴다 — 독립적 출처라는 성질은 그대로면서 제목 변종에 면역이다.
+
 ## Validation scenarios
 
 새 세션에서 이걸 물어 확인한다. 답이 맞는지보다 **스킬이 뜨는지와 스스로 SQL을 조립하는지**를 본다.
@@ -95,7 +131,18 @@ verify.py        국회 사이트가 바뀌었나    네트워크 있음 · DB �
 uv run .claude/skills/congress/Scripts/db.py selftest --db /tmp/t.db   # 우리 코드
 uv run .claude/skills/congress/Scripts/verify.py                       # 국회 사이트
 uv run .claude/skills/congress/Scripts/audit.py --db …                 # 적재된 데이터
+python3 ~/.claude/skills/harness-creator/scripts/validate_harness.py --path .   # 하네스 구조
 ```
+
+### B6·B7은 다음 세션에서만 확인된다
+
+`settings.json`도 `rules/`도 **세션 시작 때 읽힌다.** 만든 세션에서는 둘 다 안 먹으므로, 아래는 재시작 뒤에 본다.
+
+| 확인할 것 | 통과 기준 | 최근 확인 |
+|---|---|---|
+| `Scripts/bills.py`를 읽은 뒤 파서 규칙이 문맥에 있나 | 있다. 없으면 `paths:` 글롭이 안 맞는 것이다 | 미확인 |
+| `uv run .claude/skills/congress/Scripts/audit.py --db …` | 프롬프트가 안 뜬다 | 미확인 |
+| `git clean -n` | 거부된다 (dry-run도 접두가 같아 걸린다) | 미확인 |
 
 ## Change history
 
@@ -114,3 +161,18 @@ uv run .claude/skills/congress/Scripts/audit.py --db …                 # 적�
 - **B5(훅)**: 이 세션에서 `Scripts/*.py`를 열 번 넘게 고치며 `selftest`를 손으로 돌렸다. 그런데도 `bill_kind` 회귀는 세 시간 뒤에야 잡혔고, 그 사이 `bill_detail_missing` 게이트가 **아무것도 검사하지 않으면서 초록불**이었다. 편집 시점에 자동으로 돌았으면 그 자리에서 빨간불이었다.
 - **B6(permissions)**: `settings.json`이 없어 `uv run`·`sqlite3`·`gh`가 매번 프롬프트를 탄다. 프롬프트를 줄이지만 안전을 더하지는 않는다.
 - **B7(rule)**: 파서 작성의 교훈(이 도메인의 실패는 200 OK에 빈 결과다 · `<i>` 라벨을 먼저 지워라 · 열 위치 대신 `class`로 읽어라)이 지금은 코드 주석에 흩어져 있다. 다만 스키마 주석과 겹칠 소지가 있어 보류했다.
+
+### 2026-08-10 — B6·B7 생성, B5는 시점만 정하고 보류 (extend)
+
+v2 계획서(`docs/plan/260809/`)의 7단계 중 **하네스 층만** 실행했다. 코드 개편(1~5단계)은 아직 시작 전이고 `main`은 계획 커밋에서 깨끗하다.
+
+**B5를 안 만든 것은 거절이 아니라 시점이다.** 계획서는 7단계에 뒀는데 그건 필요보다 다섯 단계 늦다 — 근거는 Behavior inventory 아래에 적었다. B6·B7은 1·2단계에 의존하지 않고, 특히 B7은 파서 3종을 뜯는 2단계 내내 로드되므로 **지금 만드는 편이 값이 크다.** 그래서 순서를 갈랐다.
+
+**계획서 B6 스니펫에서 결함 둘을 코드로 확인했다.**
+
+- `Bash(rm:*CONGRESS.db*)`는 아무것도 매칭하지 않는다. Bash 규칙의 `:*`는 접두 매칭이라 중간 와일드카드가 성립하지 않는다. 보호처럼 보이면서 아무것도 보호하지 않는 모양이라 넣지 않았다.
+- "읽기 전용 점검 명령"이 넷 중 둘에 대해 사실이 아니다. `db.py schema`와 `collect.py --audit-only`가 `init_schema()`를 타고, 그 안의 `migrate_comments()`는 `writable_schema`로 DDL을 제자리에서 갈아 끼운다. 규칙은 유지하되 **설명을 사실에 맞췄다** — 인벤토리의 B6 문구에서 "읽기 전용"을 뺐다.
+
+**계획서 06번의 서술 하나를 뒤집었다.** `expected`의 출처를 제목의 `등 N인`이 아니라 응답 안의 선언값으로 바꿨다(위 B7 항목). 제목 파싱이 `외 N인` 44건과 위원장·정부 발의 1,654건에서 깨지기 때문이다.
+
+**이번 패스는 파일을 만들었을 뿐 동작을 확인하지 못했다.** `settings.json`도 `rules/`도 세션 시작 때 읽혀서, 만든 세션에서는 원리적으로 확인이 안 된다. Validation scenarios에 새로 붙인 표 셋이 그 빚이고, 다음 세션의 첫 일이다.
