@@ -39,8 +39,8 @@
 | B3 | 수집을 하루 1회 돌리고 조용히 멈추면 알린다 | 이벤트 기반이고 사람이 없을 때 돌아야 한다 | `.github/workflows/scheduled-collect.yml` | validated |
 | B4 | 수집이 멈춘 것을 맥 **밖**에서 감시한다 | 감시 대상이 맥이므로 감시자가 맥 안에 있으면 같이 죽는다 | `.github/workflows/collect-watchdog.yml` | validated |
 | B5 | `Scripts/*.py` 편집 시 `selftest`를 자동으로 돌린다 | 매번 예외 없이 일어나야 하는 일 → 훅 | (미생성) | proposed — v2 1단계 직후 |
-| B6 | 점검·조회 명령을 프롬프트 없이 허용한다 | 특정 명령의 허용/차단 → `permissions` | `.claude/settings.json` | generated |
-| B7 | 파서 작성 규칙을 `Scripts/*.py`에서만 로드한다 | 트리의 한 부분에서만 쓰이는 규칙 → 경로 한정 rule | `.claude/rules/parsers.md` | generated |
+| B6 | 점검·조회 명령을 프롬프트 없이 허용한다 | 특정 명령의 허용/차단 → `permissions` | `.claude/settings.json` | validated |
+| B7 | 파서 작성 규칙을 `Scripts/*.py`에서만 로드한다 | 트리의 한 부분에서만 쓰이는 규칙 → 경로 한정 rule | `.claude/rules/parsers.md` | validated |
 
 **B5만 아직 없고, 그건 시점 문제다.** 훅이 `selftest`를 돌리는데 v2 1단계가 `SCHEMA`를 통째로 다시 쓰므로, 그동안 켜 두면 편집마다 빨간불이 뜬다. 그런데 `PostToolUse`의 exit 2는 stderr를 루프로 되먹이므로 이건 소음에 그치지 않는다 — **의도적으로 깨 둔 중간 상태를 고치려 드는 쪽으로 세션을 끈다.**
 
@@ -134,15 +134,22 @@ uv run .claude/skills/congress/Scripts/audit.py --db …                 # 적�
 python3 ~/.claude/skills/harness-creator/scripts/validate_harness.py --path .   # 하네스 구조
 ```
 
-### B6·B7은 다음 세션에서만 확인된다
+### B6·B7 — 새 세션을 띄워서 확인한다
 
-`settings.json`도 `rules/`도 **세션 시작 때 읽힌다.** 만든 세션에서는 둘 다 안 먹으므로, 아래는 재시작 뒤에 본다.
+`settings.json`도 `rules/`도 **세션 시작 때 읽힌다.** 만든 세션에서는 둘 다 안 먹으므로 `run_e2e.py`로 헤드리스 세션을 띄워 확인했다.
 
 | 확인할 것 | 통과 기준 | 최근 확인 |
 |---|---|---|
-| `Scripts/bills.py`를 읽은 뒤 파서 규칙이 문맥에 있나 | 있다. 없으면 `paths:` 글롭이 안 맞는 것이다 | 미확인 |
-| `uv run .claude/skills/congress/Scripts/audit.py --db …` | 프롬프트가 안 뜬다 | 미확인 |
-| `git clean -n` | 거부된다 (dry-run도 접두가 같아 걸린다) | 미확인 |
+| `Scripts/bills.py`를 읽은 뒤 파서 규칙이 문맥에 있나 | 있다. 없으면 `paths:` 글롭이 안 맞는 것이다 | 2026-08-10 통과 |
+| `readme.md`만 읽었을 때 그 규칙이 **없나** | 없다. 있으면 `paths:`가 범위를 안 좁히고 있는 것이다 | 2026-08-10 통과 |
+| `uv run .claude/skills/congress/Scripts/audit.py --db …` | 프롬프트도 거부도 없이 실행된다 | 2026-08-10 통과 |
+| `git clean -n` | 거부된다 (dry-run도 접두가 같아 걸린다) | 2026-08-10 통과 |
+
+위 둘은 한 쌍으로만 뜻이 있다. 긍정만 보면 "규칙이 늘 로드되는 것"과 구별되지 않고, 부정만 보면 "아예 안 로드되는 것"과 구별되지 않는다.
+
+> **헤드리스 권한 처리는 이 저장소에서 확인됐다** — `references/e2e-testing.md`가 "문서화된 추측"이라고 표시해 둔 그 지점이다. 읽기 전용 프롬프트는 `--isolate` 없이 돌리면 되고, 그러면 `--dangerously-skip-permissions`가 안 붙어 **permissions 층이 살아 있는 채로** 검사된다. 인증도 그대로 넘어갔다(`Not logged in` 없음). 다음 e2e에서 이걸 다시 따지지 마라.
+>
+> ⚠️ `--isolate`는 `CONGRESS.db` 677MB를 통째로 복사한다. `IGNORE_PATTERNS`가 그걸 안 거른다. 쓰기가 있는 시나리오에만 붙여라.
 
 ## Change history
 
@@ -175,4 +182,6 @@ v2 계획서(`docs/plan/260809/`)의 7단계 중 **하네스 층만** 실행했�
 
 **계획서 06번의 서술 하나를 뒤집었다.** `expected`의 출처를 제목의 `등 N인`이 아니라 응답 안의 선언값으로 바꿨다(위 B7 항목). 제목 파싱이 `외 N인` 44건과 위원장·정부 발의 1,654건에서 깨지기 때문이다.
 
-**이번 패스는 파일을 만들었을 뿐 동작을 확인하지 못했다.** `settings.json`도 `rules/`도 세션 시작 때 읽혀서, 만든 세션에서는 원리적으로 확인이 안 된다. Validation scenarios에 새로 붙인 표 셋이 그 빚이고, 다음 세션의 첫 일이다.
+**같은 날, 헤드리스 세션 셋으로 둘 다 확인했다.** `settings.json`도 `rules/`도 세션 시작 때 읽혀서 만든 세션에서는 확인이 안 되는데, `run_e2e.py`가 새 세션을 띄우므로 그 제약이 풀린다. 결과는 Validation scenarios에 적었다. 근거는 각각 전사에서 인용한 것이다 — V1은 도구 호출이 `Read: bills.py` 하나뿐인 채로 규칙 문서의 `##` 소제목 셋을 그대로 재현했고(문맥 주입 말고는 나올 데가 없다), V3의 `permission_denials`에는 `git clean -n` 한 건만 들어 있고 `audit.py`는 그냥 실행됐다.
+
+**중간에 판단 하나를 정정했다.** 처음엔 "B6는 e2e로 확인 못 한다"고 봤는데, 그건 `--isolate`를 쓴다는 전제에서만 맞다. 읽기 전용 프롬프트는 격리가 필요 없고, 격리를 빼면 `--dangerously-skip-permissions`도 안 붙어 **permissions가 살아 있는 채로 검사된다.** 확인할 수 있는 것을 못 한다고 적을 뻔했다.
