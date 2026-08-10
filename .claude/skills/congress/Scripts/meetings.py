@@ -219,7 +219,15 @@ def fetch_body(session: net.Session, conference_id: int, tries: int = 4) -> str:
         r.raise_for_status()
         last = r.text
         found = set(SELF_ID_RE.findall(last))
-        id_ok = str(conference_id) in found or not found
+        # ⚠️ **`not found` 를 통과로 두면 이 가드가 통째로 무력해진다.** 2026-08-10 실측:
+        #    원천이 본문에서 pdf/xml 링크를 **빼 버렸고**, 그래서 전 회의가 `found=set()`
+        #    으로 떨어져 무조건 통과했다. 그 상태로 받은 2,047건 중 **28건이 다른 회의의
+        #    본문**이었다 — v1 의 52315 내용이 v2 의 52526 자리에 들어갔다.
+        #    문서가 자기를 안 밝히면 그건 "괜찮다"가 아니라 **"확인할 수 없다"** 이고,
+        #    확인할 수 없는 것을 확인된 것처럼 저장하는 것이 이 프로젝트에서 가장 위험하다.
+        #    막지는 않는다 — 지금 원천이 **전부** 그렇게 주므로 막으면 회의록이 통째로
+        #    안 들어온다. 대신 collect_one 이 원장에 남겨 눈에 보이게 한다.
+        id_ok = str(conference_id) in found if found else True
         # ⚠️ 메타 줄이 없는 응답도 온다. h2 · .tit 이 **둘 다 빈** 문서가 실재하고,
         #    그러면 형식이 다른 .minutes_header 로 떨어져 파싱이 깨진다(실측 8건).
         #    이것도 플래핑이라 다시 받으면 대개 들어 있다 — 그래서 "쓸 만한 문서인가"를
@@ -247,6 +255,7 @@ def collect_one(db, session: net.Session, conference_id: int, committee_class: s
     except Exception as e:
         dbm.record_failure(db, "meeting_body", conference_id, detail=f"network:{type(e).__name__}")
         return False
+
 
     try:
         meta = parse_meta(html)

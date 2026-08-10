@@ -175,6 +175,15 @@ def 회의록(s: net.Session, ok) -> None:
            f"{by.get(cls, 0)} (기준 {base})")
 
     html = meetings.fetch_body(s, 56297)
+    # ⚠️ **이 단언이 빨간불이면 `fetch_body` 의 id 대조가 통째로 무력하다.**
+    #    같은 URL 이 요청마다 다른 회의를 주는 원천이라(캐시 계층 문제) 받은 문서가
+    #    요청한 회의인지 확인할 유일한 근거가 본문 안의 pdf/xml 자기 링크다.
+    #    그게 없으면 `id_ok` 는 `not found` 로 무조건 참이 되고, 우리는 남의 회의록을
+    #    조용히 저장한다 — 2026-08-10 실측으로 실제로 그랬고 2,047건 중 28건이 그랬다.
+    #    이 프로젝트에서 조용히 틀릴 수 있는 가장 위험한 자리다.
+    ok("본문이 자기 id 를 밝힌다 (id 대조 가드의 유일한 근거)",
+       str(56297) in set(meetings.SELF_ID_RE.findall(html)),
+       f"찾은 id={sorted(set(meetings.SELF_ID_RE.findall(html)))[:3] or '(없음 — 가드 무력)'}")
     meta = meetings.parse_meta(html)
     spk, utt, agenda = meetings.parse_body(html)
     ok("56297 메타가 그대로다",
