@@ -509,8 +509,14 @@ def todo_sql(refresh_days: int = DEFAULT_REFRESH_DAYS) -> tuple[str, list]:
         SELECT bill_no, bill_id FROM bills
         WHERE (bill_kind = '법률안' OR bill_kind = '미상')
           AND (detail_collected_at IS NULL
+               -- ⚠️ **bill_detail 만 보면 안 된다.** 발의자·표결·대안이 실패한 의안은
+               --    상세 자체는 성공해서 detail_collected_at 이 찍혀 있다. 그것만 보면
+               --    그 의안은 **영영 다시 안 받아지고** 원장의 실패가 영구히 남는다.
+               --    상한(attempts)이 무한 재시도를 막으므로 넓혀도 안전하다.
                OR EXISTS (SELECT 1 FROM collect_failures f
-                          WHERE f.target_kind='bill_detail' AND f.target_key=bills.bill_no
+                          WHERE f.target_kind IN ('bill_detail','bill_vote',
+                                                  'bill_proposer','bill_alt')
+                            AND f.target_key=bills.bill_no
                             AND f.kind='retriable' AND f.attempts < ?)
                OR updated_at > detail_collected_at
                OR (outcome = '계류' AND detail_collected_at < ?))
