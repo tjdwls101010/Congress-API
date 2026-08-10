@@ -739,7 +739,14 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
                                  [{"bill_no": bill_no, **v} for v in vlist],
                                  expected=expected_votes or None)
             if unresolved:
-                sub_fail("bill_vote", f"parse:이름으로 회수 못한 표 {unresolved}건 (동명이인)")
+                # ⚠️ **kind='gone' 이다. 'retriable' 이 아니다.** 원천이 그 표에 slug 를
+                #    안 주고 이름은 동명이인이라, 다시 받아도 영원히 안 풀린다. retriable 로
+                #    두면 unresolved_retriable 게이트가 상한(5회)을 채울 때까지 빨갛고
+                #    그동안 사람이 게이트 표 전체를 안 믿게 된다 — 고칠 수 없는 것을
+                #    "아직 못 고쳤다"로 부르면 안 된다. 규모는 votes_without_slug 가 센다.
+                sub_failed.add("bill_vote")
+                dbm.record_failure(db, "bill_vote", bill_no, kind="gone",
+                                   detail=f"gone:slug 없는 표 {unresolved}건 (동명이인이라 회수 불가)")
         db.execute("UPDATE bills SET detail_collected_at = ? WHERE bill_no = ?",
                    (dbm.now_str(), bill_no))
         db.execute("COMMIT")
