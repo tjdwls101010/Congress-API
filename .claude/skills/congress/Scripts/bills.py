@@ -264,7 +264,10 @@ def parse_info(html: str) -> tuple[list[dict], list[dict], list[dict], dict]:
             for _tr, c in rows:
                 # ⚠️ 공포법률명은 의안명과 다르다 — '…기본법안(대안)' → '…기본법'.
                 #    바깥 자료와 이름으로 맞출 때 쓰는 것은 이쪽이다.
-                if name := c.get("lawName"):
+                # ⚠️ **같은 법률명이 두 행으로 오는 의안이 있다**(실측 2215141·2206640).
+                #    PK 가 (bill_no, law_name) 이라 그대로 넣으면 UNIQUE 위반으로 그 의안의
+                #    상세가 통째로 롤백된다 — 남는 것이 없어지는 쪽이 훨씬 나쁘다.
+                if (name := c.get("lawName")) and name not in {l["law_name"] for l in laws}:
                     laws.append({"law_name": name, "law_no": c.get("announceNo")})
             continue
 
@@ -387,15 +390,19 @@ def lead_names(info: str | None) -> list[str]:
 
     ``'최형두의원ㆍ이준석의원ㆍ황정아의원 등 11인'`` → ``['최형두', '이준석', '황정아']``
     ``'김석기의원 등 191인'``                        → ``['김석기']``
+    ``'김준형의원 외 22인'``                         → ``['김준형']``
     ``'행정안전위원장'``                             → ``[]``
 
     ⚠️ **대표발의가 한 명이라는 가정이 v1 의 결함이었다.** 상세 HTML 의 첫 ``/members/``
        링크만 대표로 잡아서 ``role='대표발의'`` 가 2명 이상인 의안이 **0건**이었다.
        원천은 여기서 전원을 직접 말해 준다 — 순서나 위치가 아니라 선언된 값이다.
+    ⚠️ **꼬리가 ``등 N인`` 만이 아니다. ``외 N인`` 도 있다**(실측 44건). ``등`` 만 끊으면
+       그 44건은 이름 부분이 ``'김준형의원 외 22인'`` 통째로 남아 어느 항목과도 안 맞고,
+       **대표발의가 한 명도 없는 의안**이 된다 — 에러 없이 role 이 전부 공동발의가 된다.
     """
     if not info:
         return []
-    head = dbm.norm_text(re.split(r"\s*등\s*\d+\s*인", info)[0]) or ""
+    head = dbm.norm_text(re.split(r"\s*[등외]\s*\d+\s*인", info)[0]) or ""
     return [n for part in head.split("·") if (n := re.sub(r"의원\s*$", "", part).strip())
             and part.strip().endswith("의원")]
 
@@ -568,6 +575,14 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
     declared = None
     vote_unlinked: list[dict] = []
     alt_edges: list[dict] = []
+    # ⚠️ **하위 실패는 성공하면 반드시 지워야 한다.** 안 지우면 한 번 실패한 의안이
+    #    고쳐진 뒤에도 원장에 남아 unresolved_retriable 이 영구히 빨갛고, 그러면 사람이
+    #    게이트 표 전체를 안 믿게 된다. 이번 패스에서 실패한 종류만 남기고 나머지는 지운다.
+    sub_failed: set[str] = set()
+
+    def sub_fail(kind: str, detail: str) -> None:
+        sub_failed.add(kind)
+        dbm.record_failure(db, kind, bill_no, detail=detail)
     if any(st["stage"] == "본회의" for st in stages):
         try:
             # ⚠️ **폼 전체를 보낸다.** {billId, _csrf} 만 보내면 400 "Bad Request." 12바이트가
@@ -579,13 +594,17 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
                             referer=net.LIKMS_SEARCH_PAGE).text)
             votes = (vs, vlist)
             # ⚠️ **"표결이 없다"와 "표결을 못 받았다"를 가른다.** 본회의 단계가 있어도
-            #    표결이 없는 의안이 정상으로 존재한다(대안반영폐기 등) — 그걸 실패로 적으면
-            #    고칠 수 없는 빨간불이 수천 건 쌓이고, 그러면 사람이 원장 전체를 안 믿는다.
-            #    실제로 표결에 부쳐진 의안만 판정 대상이다.
-            if vs.get("yes") is None and js.get("procResultName") in ("원안가결", "수정가결", "부결"):
-                dbm.record_failure(db, "bill_vote", bill_no, detail="parse:표결 요약 숫자가 없다")
+            #    표결 집계가 없는 의안이 정상으로 존재한다 — 대안반영폐기가 그렇고,
+            #    **비법률안이 특히 그렇다**: 임명동의안·임명승인안·사직의 건·국정감사
+            #    결과보고서 채택의 건은 '원안가결' 인데 표결 집계가 아예 없다(이의없음으로
+            #    처리된다). 실측 163건이 전부 그 부류였다.
+            #    그걸 실패로 적으면 고칠 수 없는 빨간불이 쌓이고, 그러면 사람이 원장
+            #    전체를 안 믿는다. 판정 대상은 **법률안이면서 표결에 부쳐진 것**뿐이다.
+            if (vs.get("yes") is None and f.get("billKindCd") == "법률안"
+                    and js.get("procResultName") in ("원안가결", "수정가결", "부결")):
+                sub_fail("bill_vote", "parse:표결 요약 숫자가 없다")
         except Exception as e:
-            dbm.record_failure(db, "bill_vote", bill_no, detail=f"parse:{type(e).__name__}")
+            sub_fail("bill_vote", f"parse:{type(e).__name__}")
     if js.get("proposerKindCd") == "의원":
         try:
             proposers, declared = fetch_proposers(session, bill_id, bill_no)
@@ -594,10 +613,9 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
             if d["represent"] and not any(
                     p["open_na_id"] == d["represent"] and p["role"] == "대표발의"
                     for p in proposers):
-                dbm.record_failure(db, "bill_proposer", bill_no,
-                                   detail=f"parse:대표발의 불일치 (카드 {d['represent']})")
+                sub_fail("bill_proposer", f"parse:대표발의 불일치 (카드 {d['represent']})")
         except Exception as e:
-            dbm.record_failure(db, "bill_proposer", bill_no, detail=f"parse:{type(e).__name__}")
+            sub_fail("bill_proposer", f"parse:{type(e).__name__}")
     # 대안 관계는 결말이 그것을 시사하는 의안에만 붙인다(약 5,300건). 전량에 붙이면
     # 2만 요청이 늘고 대부분은 빈 표다.
     if (js.get("procResultName") in ("대안반영폐기", "본회의불부의")
@@ -611,7 +629,7 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
                 alt_edges = [{"bill_no": o, "alt_bill_no": alt_no}
                              for o in dict.fromkeys([*absorbed, bill_no]) if o != alt_no]
         except Exception as e:
-            dbm.record_failure(db, "bill_alt", bill_no, detail=f"parse:{type(e).__name__}")
+            sub_fail("bill_alt", f"parse:{type(e).__name__}")
 
     # ⚠️ **BEGIN 이 아니라 BEGIN IMMEDIATE 다.** 이 트랜잭션은 읽기로 시작해서(아래
     #    review_status 조회) 쓰기로 넘어가는데, 기본 DEFERRED 는 그 승격 시점에
@@ -715,8 +733,7 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
                                  [{"bill_no": bill_no, **v} for v in vlist],
                                  expected=expected_votes or None)
             if unresolved:
-                dbm.record_failure(db, "bill_vote", bill_no,
-                                   detail=f"parse:이름으로 회수 못한 표 {unresolved}건 (동명이인)")
+                sub_fail("bill_vote", f"parse:이름으로 회수 못한 표 {unresolved}건 (동명이인)")
         db.execute("UPDATE bills SET detail_collected_at = ? WHERE bill_no = ?",
                    (dbm.now_str(), bill_no))
         db.execute("COMMIT")
@@ -726,6 +743,9 @@ def collect_detail(db, session: net.Session, bill_no: str, bill_id: str) -> bool
         return False
 
     dbm.clear_failure(db, "bill_detail", bill_no)
+    for kind in ("bill_vote", "bill_proposer", "bill_alt"):
+        if kind not in sub_failed:
+            dbm.clear_failure(db, kind, bill_no)
     return True
 
 

@@ -135,6 +135,9 @@ def 의안(s: net.Session, ok) -> None:
     ok("공동대표발의 3인이 전부 대표로 잡힌다",
        sum(p["role"] == "대표발의" for p in co) == 3,
        sum(p["role"] == "대표발의" for p in co))
+    # ⚠️ 꼬리가 '등 N인' 만이 아니다. '외 N인' 을 못 끊으면 그 44건은 대표발의가 0명이 된다.
+    ok("'외 N인' 꼬리도 끊는다", bills.lead_names("김준형의원 외 22인") == ["김준형"],
+       bills.lead_names("김준형의원 외 22인"))
 
     # ── 대안 양방향. 한 요청이 대안 1건과 흡수된 원안 전부를 준다.
     d4 = bills.parse_detail(s.get(f"{bills.DETAIL}?billId=PRC_I2G5G0O5P2N0O1M6L2L6T3U6S9S3R5").text)
