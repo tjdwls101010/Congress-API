@@ -601,7 +601,8 @@ CREATE TABLE IF NOT EXISTS collect_failures (
     -- 받으려다 실패한 것들. **corpus 밖이다** — 조회 질의는 이 테이블을 모른다.
     -- 성공하면 행이 삭제되므로, 비어 있는 것이 정상 상태다.
     target_kind     TEXT NOT NULL
-                    CHECK (target_kind IN ('bill_detail','bill_vote','bill_proposer','meeting_body','member')),
+                    CHECK (target_kind IN ('bill_detail','bill_vote','bill_proposer','bill_alt',
+                                           'meeting_body','member')),
     target_key      TEXT NOT NULL,           -- bill_no · conference_id · open_na_id
     kind            TEXT NOT NULL CHECK (kind IN ('retriable','gone')),
                     -- 'gone' = 원천에 없다(404 등). 재시도하지 않는 것이 정상이다.
@@ -616,6 +617,19 @@ CREATE TABLE IF NOT EXISTS collect_failures (
 
 def now_str() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def norm_text(s: str | None) -> str | None:
+    """원천 텍스트를 저장 전에 한 모양으로 만든다. **파서의 텍스트 진입점에서 부른다.**
+
+    ⚠️ **중점이 두 종류다.** 원천이 ``ㆍ``(U+318D, 한글 아래아)와 ``·``(U+00B7, 가운뎃점)를
+       섞어 쓴다 — 발의자 팝업의 ``info``는 ``최형두의원ㆍ이준석의원``이고 위원회명은
+       문서마다 갈린다. 정규화하지 않으면 **같은 이름이 두 값이 되고** 조인이 조용히 반만
+       준다. ``upsert_committee``가 위원회에 대해서만 뒤늦게 막고 있던 것을 앞으로 당긴 것이다.
+    """
+    if s is None:
+        return None
+    return re.sub(r"\s+", " ", s.replace("ㆍ", "·")).strip() or None
 
 
 def connect(path: str | Path) -> sqlite3.Connection:

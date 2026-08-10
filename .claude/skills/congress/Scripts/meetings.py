@@ -174,8 +174,12 @@ def parse_body(html: str) -> tuple[list[dict], list[dict], list[dict]]:
                                  "display_name": name, "position": pos})
         # 여러 문단이 <br>로 이어진다. 개행으로 붙여 원문 구조를 남긴다.
         paras = [s.text(strip=True) for s in blk.css("span.spk_sub")]
-        text = "\n".join(p for p in paras if p) or blk.css_first(".talk").text(
-            separator="\n", strip=True) if blk.css_first(".talk") else ""
+        # ⚠️ **괄호가 없으면 안 된다. 삼항연산자가 `or` 보다 우선순위가 낮다.**
+        #    괄호 없이 쓰면 `(A or B) if C else ""` 로 묶여서, .talk 이 없는 블록의
+        #    발언이 spk_sub 에 멀쩡히 있는데도 통째로 "" 가 된다.
+        text = ("\n".join(p for p in paras if p)
+                or (blk.css_first(".talk").text(separator="\n", strip=True)
+                    if blk.css_first(".talk") else ""))
         utterances.append({"seq": seq, "speaker_no": speakers[key], "text": text})
 
     agenda = []
@@ -282,7 +286,8 @@ def collect_one(db, session: net.Session, conference_id: int, committee_class: s
                           date_meeting, pdf_url, collected_at)
                       VALUES (?,?,?,?,?,?,?,?,?,?,?)
                       ON CONFLICT(conference_id) DO UPDATE SET
-                          session_no=excluded.session_no, sitting_no=excluded.sitting_no,
+                          session_no=excluded.session_no, session_kind=excluded.session_kind,
+                          sitting_no=excluded.sitting_no,
                           committee_name=excluded.committee_name,
                           committee_class=excluded.committee_class,
                           is_subcommittee=excluded.is_subcommittee,
